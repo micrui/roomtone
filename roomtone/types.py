@@ -32,6 +32,7 @@ class LockState:
     marker_rung: int = 0                # position on the escalation ladder
     blocks_ok: int = 0                  # consecutive blocks meeting criteria
     blocks_bad: int = 0
+    quiet: bool = False                 # block was quiet enough to update the room response
 
     def as_dict(self) -> dict[str, Any]:
         d = asdict(self)

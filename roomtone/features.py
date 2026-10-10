@@ -53,13 +53,29 @@ transient_rate (onsets per second)
     median flux of the surrounding half second (so steady noise never
     triggers), and is at least 50 ms after the previous onset.
 
+    Only the full-band flux is counted. The low-band envelope used for beat
+    (below) is not, because four bins of steady noise fluctuate enough to
+    cross a 1.5x median threshold now and then, and a kick in a quiet room
+    already shows up in the full band.
+
 beat (0..1)
     The flux curve from the onset detector, lightly smoothed and with its
     average removed, is correlated with delayed copies of itself. If sounds
     repeat at a steady tempo, the copy delayed by one beat lines up with the
-    original. beat is the best alignment found for delays between 1/3 s and
-    1 s (180 down to 60 BPM), relative to the zero-delay alignment, clipped to
-    0..1. A metronome scores high; random clatter scores near 0.
+    original, and so does the copy delayed by two beats. For each delay L
+    between 1/3 s and 1 s (180 down to 60 BPM) we average the alignment at L
+    and at 2L, relative to the zero-delay alignment, and take the best, clipped
+    to 0..1. Asking for the second beat as well is what separates a drum from
+    talk: a talker's syllables are roughly regular over two or three
+    syllables, so one delay can line up by chance, but their rate wanders, so
+    the alignment has faded by twice that delay. A metronome scores high (it
+    lines up at every multiple); random clatter and talk score low.
+
+    This is done twice and the larger result is kept: once on the full-band
+    flux, and once on flux summed over 40 to 200 Hz only (STFT bins 1 to 4 at
+    44.1 kHz). The low band catches a kick drum under a loud crowd: voices put
+    almost nothing below 200 Hz, so there the kick is the only thing changing,
+    while in the full band the crowd's flux swamps it.
 
 speech_band_centroid_hz
     The energy-weighted average frequency inside 300 to 3000 Hz: where in the
@@ -107,6 +123,7 @@ MAX_TALKERS = 8.0
 TALKERS_MIN_SPEECH = 0.2
 
 # onsets and beat
+LOW_LO_HZ, LOW_HI_HZ = 40.0, 200.0  # kick-drum band for the second beat envelope
 N_FFT = 1024
 HOP = 256
 LOG_GAIN = 100.0                   # log1p(LOG_GAIN * |X|) compression
@@ -116,6 +133,7 @@ THRESHOLD_FLOOR_PER_BIN = 0.01     # absolute floor so a silent block never trig
 MIN_ONSET_GAP_S = 0.05
 BEAT_BPM_LO, BEAT_BPM_HI = 60.0, 180.0
 BEAT_SMOOTH_FRAMES = 5
+COMB_TOLERANCE_FRAMES = 2          # slack when looking for the second beat at 2L
 
 
 def smoothstep(lo: float, hi: float, x: float) -> float:
@@ -189,12 +207,21 @@ def stft_magnitude(x: np.ndarray) -> np.ndarray:
     return np.abs(sfft.rfft(frames * window, axis=1))
 
 
-def onset_envelope(mag: np.ndarray) -> np.ndarray:
-    """Half-wave rectified spectral flux of log magnitudes, one value per hop (sr / 256 per s)."""
+def onset_envelope(mag: np.ndarray, bins: slice = slice(None)) -> np.ndarray:
+    """Half-wave rectified spectral flux of log magnitudes, one value per hop (sr / 256 per s).
+
+    `bins` restricts the sum to a range of STFT bins (the low-band path uses 40..200 Hz).
+    """
     if mag.shape[0] < 2:
         return np.zeros(0)
-    logmag = np.log1p(LOG_GAIN * mag)
+    logmag = np.log1p(LOG_GAIN * mag[:, bins])
     return np.maximum(np.diff(logmag, axis=0), 0.0).sum(axis=1).astype(np.float64)
+
+
+def low_band_bins(sample_rate: int) -> slice:
+    """STFT bins from LOW_LO_HZ to LOW_HI_HZ (bins 1..4 at 44.1 kHz)."""
+    width = sample_rate / N_FFT
+    return slice(max(int(np.ceil(LOW_LO_HZ / width)), 1), int(np.floor(LOW_HI_HZ / width)) + 1)
 
 
 def detect_onsets(flux: np.ndarray, sample_rate: int) -> np.ndarray:
@@ -211,7 +238,12 @@ def detect_onsets(flux: np.ndarray, sample_rate: int) -> np.ndarray:
 
 
 def beat_strength(flux: np.ndarray, sample_rate: int) -> float:
-    """Peak normalised autocorrelation of the onset envelope at 60..180 BPM lags."""
+    """Two-beat comb on the normalised onset-envelope autocorrelation, 60..180 BPM.
+
+    For each candidate beat lag L the score is the mean of the autocorrelation
+    at L and at 2L (best of 2L +- 2 frames, since the true period is rarely a
+    whole number of frames). Blocks too short to reach 2L fall back to L alone.
+    """
     fps = sample_rate / HOP
     lag_lo = int(np.floor(fps * 60.0 / BEAT_BPM_HI))
     lag_hi = int(np.ceil(fps * 60.0 / BEAT_BPM_LO))
@@ -225,7 +257,15 @@ def beat_strength(flux: np.ndarray, sample_rate: int) -> float:
     acf = np.fft.irfft(spec.real ** 2 + spec.imag ** 2)[:n]
     if acf[0] <= 1e-12:
         return 0.0
-    return float(np.clip(acf[lag_lo : lag_hi + 1].max() / acf[0], 0.0, 1.0))
+    # normalise to the zero lag and undo the taper of a finite block (n / (n - k))
+    acf = acf / acf[0] * (n / (n - np.arange(n)))
+    lags = np.arange(lag_lo, lag_hi + 1)
+    one = acf[lags]
+    t = COMB_TOLERANCE_FRAMES
+    if 2 * lag_hi + t >= n:
+        return float(np.clip(one.max(), 0.0, 1.0))
+    two = sliding_window_view(acf[2 * lag_lo - t : 2 * lag_hi + t + 1], 2 * t + 1)[::2].max(axis=1)
+    return float(np.clip((0.5 * (one + two)).max(), 0.0, 1.0))
 
 
 def extract(residual: np.ndarray, sample_rate: int,
@@ -252,7 +292,8 @@ def extract(residual: np.ndarray, sample_rate: int,
     flux = onset_envelope(mag)
     onsets = detect_onsets(flux, sample_rate)
     transient_rate = onsets.size / (x.size / sample_rate)
-    beat = beat_strength(flux, sample_rate)
+    low_flux = onset_envelope(mag, low_band_bins(sample_rate))
+    beat = max(beat_strength(flux, sample_rate), beat_strength(low_flux, sample_rate))
 
     labels = classifier.labels(x, sample_rate) if classifier is not None else {}
 

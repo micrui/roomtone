@@ -33,9 +33,9 @@ The steps, once per analysis block:
    squares). The ingredients (how the reference correlates with itself, and with the
    mic) come from FFTs over the whole block; the resulting equations have a special
    repeating (Toeplitz) structure that scipy solves exactly in a fraction of a
-   second. The starting guess is the previous block's response when it earned trust
-   (zero otherwise); the result is then blended half and half with it, so one noisy
-   block cannot swing it far.
+   second. The starting guess is the response from the last quiet block (zero at
+   first, or after the room moved); the result is then blended half and half with
+   it, so one noisy block cannot swing it far.
 5. Subtract and score. Residual = mic minus reference passed through the response.
    Echo suppression (ERLE) is the energy ratio of mic to residual in dB, measured on
    the quarter of the block where the residual is quietest, so a person talking does
@@ -44,12 +44,33 @@ The steps, once per analysis block:
    marker's band: tonal music only pins the response down at the notes it plays,
    so elsewhere the estimate wanders harmlessly, while the marker band is always
    measured well (that is the marker's job).
-6. Decide. Locked means suppression >= 20 dB, jitter <= 2 samples and a stable
-   response, for 3 blocks running. A sudden large response change after lock means
-   the room changed (LOST): keep the old response this block, start afresh next
-   block. Three bad blocks in a row step the marker up its ladder (longer, then
-   another band, then louder); three good blocks step it back down. Failing at the
-   top of the ladder is SATURATED.
+6. Quiet or loud. The room's own sound (talk, clatter) cannot be told from echo by
+   the mic alone, but it can by what the best-fitting response leaves behind. A
+   block is "quiet" when the marker stands clear (peak-to-sidelobe >= 10 dB), the
+   candidate response for this block suppresses the echo by >= 20 dB over the
+   block's quietest quarter, and inside the marker band, over the stretch the marker
+   occupies, what it leaves over is no more than 3 dB louder than the echo it
+   predicts (clatter and chatter fill that band; a quiet room's hiss does not, and
+   a response measured through more noise than that would not pass the stability
+   test anyway). Only quiet blocks update the response
+   (echo cancellers call this double-talk detection); loud blocks keep subtracting
+   with the frozen response from the last quiet block.
+7. Decide. Lock is about geometry: delay, drift and room response.
+   - ACQUIRING to LOCKED: 3 quiet blocks in a row (loud ones in between are
+     skipped) with jitter <= 2 samples and a stable response.
+   - Holding LOCKED: each block the marker must turn up near where the drift line
+     predicts (within 8 samples, peak-to-sidelobe >= 6 dB, lower than the 10 dB
+     needed to acquire because we know where to look) with small jitter. Low echo
+     suppression in a loud block does not drop lock. Three misses in a row go back
+     to ACQUIRING.
+   - LOST: on a quiet block after lock, the response jumps (change > 0.6): the
+     room really moved. Keep the old response this block, re-estimate from scratch
+     on the next quiet ones, LOCKED again after 3 good quiet blocks.
+   - The ladder follows the marker alone. Three blocks in a row with a weak marker
+     (below 10 dB) or large jitter step it up (longer, then another band, then
+     louder); three blocks with 6 dB to spare even after the next step down step
+     it down. Steps change only the marker, never the drift line or response.
+     At the top with the marker still lost, the status is SATURATED.
 """
 
 from __future__ import annotations
@@ -77,7 +98,12 @@ ACQUIRE_PIECE_S = 0.5       # marker piece used for the first rough search and t
 DRIFT_PIECES = 8            # pieces timed individually for the single-marker drift estimate
 TRACK_SEARCH_S = 0.005      # search half-width once the delay is known
 MAX_DRIFT_PPM = 200.0       # largest clock drift we allow for
-MIN_PSR_DB = 10.0           # weaker peaks count as "marker not found"
+MIN_PSR_DB = 10.0           # weaker peaks count as "marker not found" when acquiring
+HOLD_PSR_DB = 6.0           # weakest peak that still holds lock, at the predicted lag
+HOLD_TOLERANCE = 8.0        # samples off the drift line a held (weak) marker may sit
+RELAX_MARGIN_DB = 6.0       # spare peak height needed, after a step down, to take it
+QUIET_BAND_SNR_DB = -3.0    # predicted echo over leftover in the marker band, for "quiet"
+LOST_ERLE_DROP_DB = 6.0     # a real room change also makes the old response fit this much worse
 REACQUIRE_JUMP = 16.0       # a marker this far off the drift line means the delay re-settled
 STABLE_CHANGE = 0.3         # response change below this counts as stable
 LOST_CHANGE = 0.6           # response change above this, after lock, means the room changed
@@ -248,7 +274,8 @@ def _solve_rir(x: np.ndarray, y: np.ndarray, tail: int, reg: float,
     """Regularised least squares: argmin |y - x*h|^2 + lam |h - start|^2, lam = reg * mean power * N.
 
     The normal equations R h = p use the reference's autocorrelation R (Toeplitz) and
-    its cross-correlation p with the mic, both computed with FFTs.
+    its cross-correlation p with the mic, both computed with FFTs. Without a start,
+    the first solution becomes the start of a second solve (iterated ridge).
     """
     hist = len(x) - len(y)
     nfft = next_fast_len(len(x) + tail, real=True)
@@ -259,9 +286,11 @@ def _solve_rir(x: np.ndarray, y: np.ndarray, tail: int, reg: float,
     lam = reg * r[0]
     col = r.copy()
     col[0] += lam
-    if start is not None:
-        p = p + lam * _fit(tail, start)
-    return solve_toeplitz(col, p)
+    if start is None:
+        # from scratch, the ridge shrinks even well-measured parts toward zero; one
+        # more solve pulled toward the first answer instead removes most of that
+        start = solve_toeplitz(col, p)
+    return solve_toeplitz(col, p + lam * _fit(tail, start))
 
 
 def estimate_rir(reference_aligned: np.ndarray, mic: np.ndarray, tail_samples: int,
@@ -357,8 +386,9 @@ class Locker:
     starts; `mic` is the mic block with the same nominal sample index in the mic's
     clock. Blocks are expected back to back (a gap clears the carried-over reference
     history). After each call `.params` holds the marker parameters to emit next and
-    `.rir` the current room response. A `baseline` response, if given, is the
-    starting point.
+    `.rir` the current room response. A `baseline` response (given here, or assigned
+    to `.rir` before the first block) is the starting point, and a first quiet block
+    that agrees with it counts towards lock straight away.
     """
 
     def __init__(self, cfg: Config, baseline: np.ndarray | None = None) -> None:
@@ -372,21 +402,37 @@ class Locker:
     def reset(self, full: bool = False) -> None:
         """Re-acquire timing (after a stream restart). `full` also forgets the room, drift and ladder."""
         self._lags: list[tuple[int, float]] = []
+        self._pair_err: float | None = None
         self._misses = 0
         self._ref_tail = np.zeros(self._context)
         self._expect_start: int | None = None
         self.status = LockStatus.ACQUIRING
-        self._ok = self._bad = 0
+        self._ok = 0
         self._ladder_ok = self._ladder_bad = 0
         self._from_scratch = False
-        self._last_band: tuple[float, float] | None = None
         if full:
             self.params: MarkerParams = self.cfg.marker
             self._rung = 0
             self._drift = 0.0
             self._drift_known = False
-            self.rir: np.ndarray | None = None if self.baseline is None else _fit(self.tail, self.baseline)
-            self._trust_prior = self.rir is not None
+            self._rir: np.ndarray | None = None
+            self._rir_band: tuple[float, float] | None = None
+            self._trust_prior = False
+            self._primed = False
+            if self.baseline is not None:
+                self.rir = self.baseline
+
+    @property
+    def rir(self) -> np.ndarray | None:
+        """The room response in use (frozen while the room is loud)."""
+        return self._rir
+
+    @rir.setter
+    def rir(self, h: np.ndarray | None) -> None:
+        """Start from a known response, such as the empty-house baseline."""
+        self._rir = None if h is None else _fit(self.tail, h)
+        self._rir_band = None
+        self._trust_prior = self._primed = h is not None
 
     @property
     def marker(self) -> np.ndarray:
@@ -402,6 +448,9 @@ class Locker:
         return None
 
     def _jitter(self) -> float | None:
+        """Spread of recent markers about the drift line (two markers: the second's prediction error)."""
+        if len(self._lags) == 2:
+            return self._pair_err
         if len(self._lags) < 3:
             return None
         xs, ys = np.array(self._lags).T
@@ -409,10 +458,15 @@ class Locker:
         return float(np.std((ys - (ym + s * (xs - xm)))[-JITTER_POINTS:]))
 
     def _locate(self, y: np.ndarray, marker: np.ndarray, start: int) -> tuple[float, float, float | None]:
-        """Marker lag and PSR in this block, plus the drift line's prediction (if any)."""
+        """Marker lag and PSR in this block, plus the drift line's prediction (if any).
+
+        With a drift line, search near its prediction. Without one, or after two
+        misses while not holding lock, search wide.
+        """
         fs = self.sample_rate
         predicted = self._predict(start)
-        if predicted is not None and self._misses < 2:
+        holding = self.status in (LockStatus.LOCKED, LockStatus.LOST)
+        if predicted is not None and (holding or self._misses < 2):
             search = int(TRACK_SEARCH_S * fs)
             if len(self._lags) < 2 and not self._drift_known:
                 search += int(MAX_DRIFT_PPM * 1e-6 * abs(start - self._lags[-1][0]))
@@ -427,7 +481,23 @@ class Locker:
         lag, psr = find_marker(y, marker, rough, search, True, self._drift)
         return lag, psr, predicted
 
+    def _band_snr_db(self, echo: np.ndarray, residual: np.ndarray, band: tuple[float, float]) -> float:
+        """Echo over residual energy inside the marker band, dB (Parseval on the block spectra)."""
+        nfft = next_fast_len(len(echo), real=True)
+        f = np.arange(nfft // 2 + 1) * self.sample_rate / nfft
+        sel = (f >= band[0]) & (f <= band[1])
+        e = float(np.sum(np.abs(rfft(echo, nfft)[sel]) ** 2))
+        r = float(np.sum(np.abs(rfft(residual, nfft)[sel]) ** 2))
+        return float(10.0 * np.log10(max(e, 1e-300) / max(r, 1e-300)))
+
+    @staticmethod
+    def _relax_cost_db(p: MarkerParams) -> float:
+        """How much marker peak height a step down the ladder gives up (band moves count as 0)."""
+        q = p.relax()
+        return 10.0 * np.log10(p.length_s / q.length_s) + (p.level_db - q.level_db)
+
     def _move(self, new: MarkerParams, step: int) -> None:
+        """Step the ladder. Only the marker changes: lag history, drift line and response stay."""
         if new == self.params:
             return
         log.info("marker ladder %s: %s -> %s", "up" if step > 0 else "down", self.params, new)
@@ -443,106 +513,143 @@ class Locker:
         caller knows them (MarkerScheduler.emitted_params); otherwise the Locker
         assumes its own `.params` were used.
         """
-        cfg, fs, T = self.cfg, self.sample_rate, self.tail
+        cfg, fs, T, H = self.cfg, self.sample_rate, self.tail, self.cfg.hysteresis_blocks
         used = params or self.params
         x = np.asarray(reference, dtype=np.float64)
         y = np.asarray(mic, dtype=np.float64)
         n = len(y)
         out_dtype = mic.dtype if np.issubdtype(np.asarray(mic).dtype, np.floating) else np.float64
         band = (used.band_lo_hz, used.band_hi_hz)
-        band_changed = self._last_band is not None and band != self._last_band
-        self._last_band = band
         if self._expect_start is not None and emission_start != self._expect_start:
             self._ref_tail = np.zeros(self._context)
         self._expect_start = emission_start + len(x)
+        prev = self.status
 
-        # 1. find the marker
+        # 1. find the marker, and see whether it sits on the drift line
         lag, psr, predicted = self._locate(y, generate(used, fs), emission_start)
-        found = psr >= MIN_PSR_DB
-        if found:
-            self._misses = 0
-            if len(self._lags) >= 2 and predicted is not None and abs(lag - predicted) > REACQUIRE_JUMP:
-                log.info("delay moved %.1f samples off the drift line; re-acquiring", lag - predicted)
-                self._lags.clear()
+        strong = psr >= MIN_PSR_DB
+        off_line = None if predicted is None else abs(lag - predicted)
+        moved = strong and len(self._lags) >= 2 and off_line is not None and off_line > REACQUIRE_JUMP
+        if moved:
+            log.info("delay moved %.1f samples off the drift line; re-acquiring", lag - predicted)
+            self._lags.clear()
+        if strong:
+            if len(self._lags) == 1 and off_line is not None:
+                self._pair_err = off_line
             self._lags = (self._lags + [(emission_start, lag)])[-HISTORY_POINTS:]
-        else:
-            self._misses += 1
-            log.debug("marker not found at %d (psr %.1f dB)", emission_start, psr)
+        held = strong or (psr >= HOLD_PSR_DB and off_line is not None and off_line <= HOLD_TOLERANCE)
 
-        # 2. drift and delay
+        # 2. drift, delay and jitter
         if len(self._lags) >= 2:
             self._drift = estimate_drift([l for _, l in self._lags], [e for e, _ in self._lags])
             self._drift_known = True
         delay = self._predict(emission_start)
         jitter = self._jitter()
+        jitter_bad = jitter is not None and jitter > cfg.lock_jitter_samples
+        self._misses = 0 if held and not jitter_bad else self._misses + 1
 
         ext = np.concatenate([self._ref_tail, x])
         self._ref_tail = ext[len(ext) - self._context:]
         state = LockState(drift_ppm=self._drift, peak_to_sidelobe_db=psr,
                           jitter_samples=jitter or 0.0, marker_rung=self._rung)
 
+        quiet = lost = False
+        change = 2.0
         if delay is None:
-            residual, erle, change, lost = y.copy(), 0.0, 2.0, False
+            residual, erle = y.copy(), 0.0
         else:
             # 3. align: aligned[T + k] lines up with mic[k]; the first T samples are history
             m = np.arange(-T, n, dtype=np.float64)
             aligned = warp(ext, self._context + (m + PRE_ROLL - delay) / (1.0 + self._drift * 1e-6))
 
-            # 4. room response, pulled toward the previous one when that one earned trust
-            prior = self.rir if (self._trust_prior and not self._from_scratch) else None
+            # 4. a candidate response for this block, and is the room quiet enough to trust it?
+            prior = self._rir if (self._trust_prior and not self._from_scratch) else None
             est = _solve_rir(aligned, y, T, RIR_REG, prior)
-            change = (rir_change(band_limit(est, *band, fs), band_limit(self.rir, *band, fs))
-                      if self.rir is not None else 2.0)
-            lost = self.status == LockStatus.LOCKED and change > LOST_CHANGE and not band_changed
-            if lost:
-                log.info("room response jumped (change %.2f); keeping the old one this block", change)
-                use = self.rir
-                self._from_scratch = True
-            else:
-                use = est if prior is None else 0.5 * est + 0.5 * prior
-                self.rir = use
-                self._from_scratch = False
+            cand = subtract(aligned, y, est)
+            cand_erle = erle_db(y, cand, segment=int(ERLE_SEGMENT_S * fs))
+            a = min(max(int(lag), 0), n - 1)
+            b = min(n, a + int(len(generate(used, fs)) * (1.0 + self._drift * 1e-6)) + T)
+            band_snr = self._band_snr_db((y - cand)[a:b], cand[a:b], band)   # over the marker's span
+            quiet = strong and cand_erle >= cfg.lock_erle_db and band_snr >= QUIET_BAND_SNR_DB
+            log.debug("block %d: psr %.1f dB, candidate erle %.1f dB, marker-band snr %.1f dB -> %s",
+                      emission_start, psr, cand_erle, band_snr, "quiet" if quiet else "loud")
+            band_changed = self._rir_band is not None and band != self._rir_band
+            if self._rir is not None:
+                lo, hi = band if self._rir_band is None else (max(band[0], self._rir_band[0]),
+                                                              min(band[1], self._rir_band[1]))
+                change = rir_change(band_limit(est, lo, hi, fs), band_limit(self._rir, lo, hi, fs))
 
-            # 5. subtract and score
-            residual = subtract(aligned, y, use)
+            # 5. adapt on quiet blocks only; loud blocks subtract with the frozen response
+            if quiet:
+                frozen = None
+                if prev == LockStatus.LOCKED and change > LOST_CHANGE and not band_changed:
+                    frozen = subtract(aligned, y, self._rir)
+                    worse = cand_erle - erle_db(y, frozen, segment=int(ERLE_SEGMENT_S * fs))
+                    lost = worse >= LOST_ERLE_DROP_DB
+                if lost:
+                    log.info("room response jumped (change %.2f); keeping the old one this block", change)
+                    residual = frozen
+                    self._from_scratch = True
+                else:
+                    use = est if prior is None else 0.5 * est + 0.5 * prior
+                    residual = cand if prior is None else subtract(aligned, y, use)
+                    self._rir, self._rir_band = use, band
+                    self._from_scratch = False
+                    self._trust_prior = True
+            elif self._rir is not None:
+                residual = subtract(aligned, y, self._rir)
+            else:
+                residual = cand                    # nothing to freeze yet: use, but do not keep
             erle = erle_db(y, residual, segment=int(ERLE_SEGMENT_S * fs))
-            self._trust_prior = not lost and erle >= cfg.lock_erle_db / 2
             state.delay_samples = float(delay)
 
-        # 6. decide
-        good = (found and erle >= cfg.lock_erle_db and jitter is not None
-                and jitter <= cfg.lock_jitter_samples and change < STABLE_CHANGE)
-        H = cfg.hysteresis_blocks
-        if good:
-            self._ok, self._bad = self._ok + 1, 0
-            self._ladder_ok, self._ladder_bad = self._ladder_ok + 1, 0
-        else:
-            self._ok, self._bad = 0, self._bad + 1
-            self._ladder_ok, self._ladder_bad = 0, self._ladder_bad + 1
-
-        prev = self.status
-        if lost:
-            status = LockStatus.LOST
+        # 6. decide. Only quiet blocks count towards (or against) acquiring lock.
+        vouched = self._primed and quiet and jitter is None
+        good = quiet and not lost and change < STABLE_CHANGE and (vouched or (jitter is not None
+                                                                              and not jitter_bad))
+        if quiet:
+            self._ok = self._ok + 1 if good else 0
+            self._primed = False
+        if moved:
+            status, self._ok = LockStatus.ACQUIRING, 0
+        elif lost:
+            status, self._ok = LockStatus.LOST, 0
+        elif prev in (LockStatus.LOCKED, LockStatus.LOST):
+            if self._misses >= H:
+                status, self._ok = LockStatus.ACQUIRING, 0
+            elif prev == LockStatus.LOST and self._ok >= H:
+                status = LockStatus.LOCKED
+            else:
+                status = prev                      # geometry holds: loud rooms do not drop lock
         elif self._ok >= H:
             status = LockStatus.LOCKED
-        elif prev in (LockStatus.LOCKED, LockStatus.LOST) and self._bad < H:
-            status = prev                       # hold through brief trouble
         else:
             status = LockStatus.ACQUIRING
+
+        # the ladder follows the marker alone: weak or wobbly markers step it up
+        if not strong or jitter_bad:
+            self._ladder_bad, self._ladder_ok = self._ladder_bad + 1, 0
+        else:
+            self._ladder_bad = 0
+            comfortable = self._rung > 0 and psr >= MIN_PSR_DB + RELAX_MARGIN_DB + self._relax_cost_db(used)
+            self._ladder_ok = self._ladder_ok + 1 if comfortable else 0
         if self._ladder_bad >= H:
-            if self.params.at_ceiling:
-                status = LockStatus.SATURATED
-            else:
+            if not self.params.at_ceiling:
                 self._move(self.params.escalate(), +1)
-        elif status == LockStatus.LOCKED and self._ladder_ok >= H and self._rung > 0:
+            elif status not in (LockStatus.LOCKED, LockStatus.LOST):
+                status = LockStatus.SATURATED
+        elif self._ladder_ok >= H:
             self._move(self.params.relax(), -1)
+
         if status != prev:
-            log.info("lock %s -> %s (erle %.1f dB, jitter %s, change %.2f)", prev.value, status.value,
-                     erle, "n/a" if jitter is None else f"{jitter:.3f}", change)
+            log.info("lock %s -> %s (erle %.1f dB, psr %.1f dB, jitter %s, change %.2f, %s)",
+                     prev.value, status.value, erle, psr,
+                     "n/a" if jitter is None else f"{jitter:.3f}", change, "quiet" if quiet else "loud")
         self.status = status
 
         state.status = status
+        state.quiet = quiet
         state.erle_db = erle
         state.rir_change = change
-        state.blocks_ok, state.blocks_bad = self._ok, self._bad
+        state.blocks_ok, state.blocks_bad = self._ok, self._misses
         return residual.astype(out_dtype), state

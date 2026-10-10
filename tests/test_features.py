@@ -1,4 +1,8 @@
-"""Feature extraction on small synthetic signals built here (no roomtone.sim)."""
+"""Feature extraction on small synthetic signals.
+
+Most signals are built here; the crowd tests use roomtone.sim.speech_like for
+its jittered talkers, the same ones the simulated kitchen uses.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +15,7 @@ from scipy import signal
 
 from roomtone.classify import Classifier, NullClassifier, YamnetClassifier, to_yamnet_input
 from roomtone.features import extract
+from roomtone.sim import speech_like as sim_talker
 
 SR = 44_100
 SECONDS = 10.0
@@ -93,6 +98,61 @@ def test_random_clicks_have_no_beat(rng):
     f = extract(clicks(rng, SECONDS, times), SR)
     assert f.beat < 0.3
     assert f.transient_rate > 1.5
+
+
+# Crowd and kick, as in the simulated kitchen's party phase ----------------------
+
+TALKER_RATES = np.linspace(3.2, 5.8, 8)    # syllables per second, one per talker
+TALKER_JITTER = 0.15
+
+
+def crowd(rng: np.random.Generator, seconds: float, talkers: int = 8,
+          total_db: float = -18.0) -> np.ndarray:
+    """`talkers` jittered voices at their own syllable rates, total_db together."""
+    each_db = total_db - 10.0 * np.log10(talkers)
+    rates = rng.choice(TALKER_RATES, talkers, replace=False)
+    return np.sum([sim_talker(seconds, SR, rng, rms_db=each_db, syllable_hz=float(r),
+                              jitter=TALKER_JITTER) for r in rates], axis=0, dtype=np.float64)
+
+
+def kick(seconds: float, period_s: float = 0.5, rms_db: float = -22.0) -> np.ndarray:
+    """60 Hz sine dying away with a 150 ms time constant, every period_s, at rms_db."""
+    t = np.arange(int(7 * 0.15 * SR)) / SR
+    hit = np.sin(2 * np.pi * 60.0 * t) * np.exp(-t / 0.15)
+    n, step = int(seconds * SR), int(round(period_s * SR))
+    x = np.zeros(n + hit.size)
+    for i in range(0, n, step):
+        x[i : i + hit.size] += hit
+    x = x[:n]
+    return x * 10.0 ** (rms_db / 20.0) / np.sqrt(np.mean(x[hit.size :] ** 2))
+
+
+def test_kick_under_crowd_has_beat(rng):
+    f = extract(crowd(rng, SECONDS) + kick(SECONDS), SR)
+    assert f.beat > 0.5
+
+
+def test_crowd_alone_has_no_beat(rng):
+    f = extract(crowd(rng, SECONDS), SR)
+    assert f.beat < 0.3
+    assert f.speech > 0.3
+
+
+@pytest.mark.parametrize("rate", TALKER_RATES)
+def test_jittered_talker_has_no_beat(rng, rate):
+    f = extract(sim_talker(SECONDS, SR, rng, rms_db=-25.0, syllable_hz=float(rate),
+                           jitter=TALKER_JITTER), SR)
+    assert f.beat < 0.3
+
+
+def test_small_table_has_no_beat(rng):
+    assert extract(crowd(rng, SECONDS, talkers=3, total_db=-28.0), SR).beat < 0.3
+
+
+@pytest.mark.parametrize("bpm", [60, 90, 180])
+def test_kick_tempo_range(rng, bpm):
+    quiet_crowd = crowd(rng, SECONDS, total_db=-30.0)
+    assert extract(quiet_crowd + kick(SECONDS, 60.0 / bpm), SR).beat > 0.5
 
 
 def test_steady_noise_has_no_onsets(rng):

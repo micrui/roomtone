@@ -7,7 +7,7 @@ from scipy.signal import fftconvolve
 from roomtone import lock
 from roomtone.config import Config, MarkerParams
 from roomtone.marker import MarkerScheduler, generate
-from roomtone.sim import SimRoom, pad_like, speech_like, synthetic_rir
+from roomtone.sim import SimRoom, clatter, pad_like, speech_like, synthetic_rir
 from roomtone.types import LockStatus
 
 FS = 44_100
@@ -125,25 +125,32 @@ class Block:
     mic: np.ndarray
     residual: np.ndarray
     params: MarkerParams
+    rir: np.ndarray | None
 
 
-def run_session(cfg: Config, room: SimRoom, blocks: int, room_sound=None, before=None) -> list[Block]:
+def run_session(cfg: Config, room: SimRoom, blocks: int, room_sound=None, before=None,
+                music_db: float = -20.0, locker: lock.Locker | None = None) -> list[Block]:
     """Mixer + room + Listener loop: music plus marker out, mic back, Locker per block."""
     n = round(cfg.block_seconds * FS)
-    sched = MarkerScheduler(cfg.marker, FS)
-    locker = lock.Locker(cfg)
+    locker = locker or lock.Locker(cfg)
+    sched = MarkerScheduler(locker.params, FS)
     log: list[Block] = []
     for k in range(blocks):
         if before:
             before(k, room, log)
-        music = pad_like(cfg.block_seconds, FS, t0=k * cfg.block_seconds)
+        music = pad_like(cfg.block_seconds, FS, t0=k * cfg.block_seconds, rms_db=music_db)
         out = music + sched.block(k * n, n, rms(music))
         mic = room.render(out, room_sound(k, log) if room_sound else None)
         residual, state = locker.process(out, mic, k * n, sched.emitted_params[-1])
         sched.set_params(locker.params)
         assert residual.dtype == np.float32 and len(residual) == n
-        log.append(Block(state.status, state, mic, residual, sched.emitted_params[-1]))
+        rir = None if locker.rir is None else locker.rir.copy()
+        log.append(Block(state.status, state, mic, residual, sched.emitted_params[-1], rir))
     return log
+
+
+def short_blocks() -> Config:
+    return Config(block_seconds=10.0, marker=MarkerParams(period_s=10.0))
 
 
 def test_pipeline_locks_subtracts_and_leaves_speech():
@@ -178,12 +185,14 @@ def test_pipeline_locks_subtracts_and_leaves_speech():
     assert last.marker_rung == 0                                       # never needed to escalate
 
 
-def test_loud_room_climbs_the_ladder_and_saturates():
+def test_marker_lost_in_noise_climbs_the_ladder_and_saturates():
+    # quiet music (so a quiet marker) in a room 40 dB louder: the marker is never found
     start = MarkerParams(length_s=16.0, level_db=-15.0)               # a few rungs below the top
     cfg = Config(marker=start)
-    room = SimRoom(FS, delay_samples=3300, drift_ppm=50.0, noise_db=-10.0)
-    log = run_session(cfg, room, 12)
+    room = SimRoom(FS, delay_samples=3300, drift_ppm=50.0, noise_db=0.0)
+    log = run_session(cfg, room, 12, music_db=-40.0)
     statuses = [b.status for b in log]
+    assert all(b.state.peak_to_sidelobe_db < lock.MIN_PSR_DB for b in log)
     assert LockStatus.LOCKED not in statuses
     emitted = [b.params for b in log]
     assert emitted[3].length_s == 30.0 and emitted[2].length_s == 16.0      # longer first
@@ -194,8 +203,81 @@ def test_loud_room_climbs_the_ladder_and_saturates():
     assert log[-1].state.marker_rung == 3
 
 
+def test_loud_room_with_a_clear_marker_does_not_climb():
+    # steady white noise about 12 dB under the echo: too loud to adapt on, but the
+    # marker still stands out, so there is no reason to climb the ladder
+    room = SimRoom(FS, delay_samples=3300, drift_ppm=50.0, noise_db=-30.0)
+    log = run_session(short_blocks(), room, 4)
+    assert all(b.state.peak_to_sidelobe_db >= lock.MIN_PSR_DB for b in log)
+    assert not any(b.state.quiet for b in log)
+    assert all(b.status == LockStatus.ACQUIRING for b in log)          # never quiet, so never locks
+    assert all(b.state.marker_rung == 0 and b.params == log[0].params for b in log)
+
+
+def test_double_talk_freezes_the_response_and_holds_lock():
+    cfg = short_blocks()
+    room = SimRoom(FS, delay_samples=3300, drift_ppm=50.0)
+    rng = np.random.default_rng(11)
+    loud = range(4, 10)
+
+    def kitchen(k, log):
+        if k not in loud:
+            return None
+        echo_db = 20 * np.log10(rms(log[3].mic))           # the music as the mic hears it
+        crowd = sum(speech_like(cfg.block_seconds, FS, rng, rms_db=0.0, syllable_hz=hz, jitter=0.15)
+                    for hz in (3.3, 4.1, 4.8, 5.6))
+        crowd = crowd * (10 ** ((echo_db - 18.0) / 20.0) / rms(crowd))
+        clicks = clatter(cfg.block_seconds, FS, rng, rate_hz=4.0, rms_db=echo_db - 12.0)
+        return (crowd + clicks).astype(np.float32)
+
+    log = run_session(cfg, room, 13, room_sound=kitchen)
+    statuses = [b.status for b in log]
+    first = statuses.index(LockStatus.LOCKED)
+    assert first <= 3                                                    # locked before the noise
+    assert all(s == LockStatus.LOCKED for s in statuses[first:])        # never ACQUIRING or LOST
+    assert all(not log[k].state.quiet for k in loud)
+    assert all(log[k].state.quiet for k in range(len(log)) if k not in loud)
+    frozen = log[loud[0] - 1].rir
+    assert all(np.array_equal(log[k].rir, frozen) for k in loud)       # no adaptation while loud
+    assert not np.array_equal(log[-1].rir, frozen)                       # adaptation resumes after
+    for k in loud:
+        assert lock.erle_db(log[k].mic, log[k].residual) < 15.0         # the room's sound is left in
+    for b in log[-3:]:
+        assert b.state.erle_db >= 20.0
+        assert lock.erle_db(b.mic, b.residual) >= 20.0
+
+
+def test_baseline_primed_session_locks_early():
+    room = SimRoom(FS, delay_samples=3300, drift_ppm=50.0)
+    cfg = short_blocks()
+    tail = round(cfg.rir_tail_seconds * FS)
+    baseline = np.zeros(tail)                                            # the empty-house response
+    baseline[lock.PRE_ROLL:] = room.rir[DIRECT:DIRECT + tail - lock.PRE_ROLL]
+    locker = lock.Locker(cfg)
+    locker.rir = baseline                                                # as `roomtone run --baseline` does
+    log = run_session(cfg, room, 3, locker=locker)
+    assert log[2].status == LockStatus.LOCKED                            # instead of block 4
+
+
+def test_stepping_down_the_ladder_keeps_lock():
+    cfg = short_blocks()
+    locker = lock.Locker(cfg)
+    locker.params = MarkerParams(period_s=10.0, level_db=-20.0)    # two level rungs up the ladder
+    locker._rung = 2
+    log = run_session(cfg, SimRoom(FS, delay_samples=3300, drift_ppm=50.0), 7, locker=locker)
+    statuses = [b.status for b in log]
+    levels = [b.params.level_db for b in log]
+    first = statuses.index(LockStatus.LOCKED)
+    assert all(s == LockStatus.LOCKED for s in statuses[first:])
+    stepped_while_locked = [k for k in range(first + 1, len(log)) if levels[k] != levels[k - 1]]
+    assert stepped_while_locked                                           # a rung came down under lock
+    assert levels[-1] == -30.0 and log[-1].state.marker_rung == 0
+    assert len(locker._lags) == len(log)                                  # lag history never cleared
+    assert all(b.state.rir_change < lock.STABLE_CHANGE for b in log[1:])  # nor the response
+
+
 def test_room_change_goes_lost_then_relocks():
-    cfg = Config(block_seconds=10.0, marker=MarkerParams(period_s=10.0))
+    cfg = short_blocks()
     room = SimRoom(FS, delay_samples=3300, drift_ppm=50.0)
     moved = synthetic_rir(FS, np.random.default_rng(99))
 

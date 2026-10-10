@@ -131,3 +131,15 @@ leave, and the only thing listening is a mic and a laptop on the counter. The tr
 makes it work is a signal nobody hears, 30 dB under the music, that lets the machine tell its
 own playing apart from the room. And the score stays open: you can sit down with the Tidal
 file at any moment and play along with the room, and neither of you overwrites the other.
+
+## Known limits of this build
+
+- Everything above was verified in simulation only. No M8, mic, or Sonos has touched
+  this code yet; docs/BENCH.md is the first thing to run on real hardware.
+- The lock decides a block is "quiet" partly by comparing leftover energy in the marker
+  band with the echo it predicts. If the music is far quieter than the mic noise floor,
+  the marker is too, every block reads as loud, and the room response never adapts.
+  Raise the marker level or the music level if the TUI never shows a quiet block.
+- Tidal patterns and the SuperCollider startup were written carefully but never
+  evaluated here. Expect to fix a name or two on first evaluation.
+- YAMNet labels are wired but need the model file and the `roomtone[yamnet]` extra.
