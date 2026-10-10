@@ -140,6 +140,24 @@ def test_sim_backend_threaded_runs_and_stops(monkeypatch):
     assert io.position >= 4096
 
 
+def test_sim_backend_plays_the_kitchen_script():
+    cfg = small_cfg()
+    backend = SimBackend(cfg, realtime=False, script=[(1.0, "empty"), (1.0, "party")])
+    assert backend.script.phase_at(1.5) == "party"
+    io = AudioIO(cfg, None, backend=backend, mute_music=True)
+    io.open()
+    backend.run_frames(16000)
+    mic = io.mic_ring.read(16000, at=0)[:, 0].astype(np.float64)
+    level = [20 * np.log10(np.sqrt(np.mean(m * m))) for m in (mic[1000:7000], mic[9000:15000])]
+    assert level[0] < -45 and level[1] > -20
+
+
+def test_sim_backend_without_sim_module_drops_the_script(monkeypatch):
+    monkeypatch.setitem(sys.modules, "roomtone.sim", None)
+    backend = SimBackend(small_cfg(), realtime=False, script=[(1.0, "party")])
+    assert backend.script is None
+
+
 def test_pad_is_quiet_and_continuous():
     pad = PadSynth(8000)
     a, b = pad.next(4000), pad.next(4000)

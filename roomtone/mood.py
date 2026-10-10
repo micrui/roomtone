@@ -3,10 +3,18 @@
 Each 30 s block of features becomes three raw numbers between 0 and 1:
 
 energy
-    Loudness mapped linearly from -60 dBFS (0) to -20 dBFS (1), plus up to
-    0.3 more for transients (0.075 per onset per second, full at 4 per
-    second), so a quiet room with clatter in it still reads as active.
-    Clipped to 1.
+    Loudness relative to the room's own quiet floor, plus up to 0.3 more for
+    transients (0.075 per onset per second, full at 4 per second), so a quiet
+    room with clatter in it still reads as active. Clipped to 1.
+
+    The quiet floor is the lowest block level of the last 240 blocks (about
+    two hours at 30 s), starting from the first block and never taken below
+    -60 dBFS (digital silence is not a room). Loudness is 0 up to 6 dB above
+    the floor and rises linearly to 1 at 36 dB above it; anything louder than
+    -20 dBFS counts as 1 whatever the floor. So a mic whose own hiss sits at
+    -48 dBFS reads an empty room as 0, not as a third of the way to loud.
+    Without a floor (raw_vector called on its own), loudness falls back to a
+    fixed scale from -60 dBFS (0) to -20 dBFS (1).
 voices
     The speech score, scaled from 0.75 of itself for one talker up to all of
     itself at four or more talkers: a crowd counts more than a single voice.
@@ -21,14 +29,17 @@ music around. The result is then rate-limited: no component moves more than
 0.15 per block, so a full swing takes at least seven blocks (about 3.5 min).
 
 The named state is for the log and for coarse layer decisions. Each block's
-raw vector gets a candidate name from classify_vector:
+raw vector, with its onset rate, gets a candidate name from classify_vector:
 
     LOUD_BUSY     energy > 0.75, or the lock is SATURATED (the room drowns the
                   marker, which only happens when it is very loud)
     CONVERSATION  voices >= 0.4
     EMPTY         energy < 0.2 and voices < 0.2
-    COOKING       everything else: something is making sound, but it is not
-                  mostly talk and not overwhelming (transients push energy up)
+    COOKING       something is making sound that is not mostly talk and not
+                  overwhelming, and there is evidence of activity: at least
+                  0.5 onsets per second, or energy >= 0.35 from loudness alone
+    EMPTY         everything else: a fridge or a fan with no onsets and no
+                  speech is an empty room unless it is loud in its own right
 
 The candidate comes from the block itself rather than the smoothed vector, so
 the hysteresis count means what it says: the name changes once the same new
@@ -63,28 +74,55 @@ RECENCY_DECAY = 0.75            # weight ratio between a block and the one after
 MAX_STEP = 0.15                 # largest change per block in any component
 UNLOCKED_CONFIDENCE = 0.5
 
+FLOOR_BLOCKS = 240              # blocks of history the quiet floor is the minimum of
+FLOOR_MARGIN_DB = 6.0           # loudness starts this far above the floor
+RELATIVE_SPAN_DB = 30.0         # and reaches 1 this much further up
+FLOOR_LOG_STEP_DB = 1.0         # log the floor when it moves at least this much
+
 LOUD_ENERGY = 0.75
 CONVERSATION_VOICES = 0.4
 EMPTY_ENERGY = 0.2
 EMPTY_VOICES = 0.2
+COOKING_TRANSIENTS = 0.5        # onsets per second that count as activity
+COOKING_LOUDNESS = 0.35         # or this much energy from loudness alone
 
 
-def classify_vector(energy: float, voices: float, rhythm: float, saturated: bool) -> MoodName:
-    """Named state for one mood vector. rhythm is accepted for future rules but unused."""
+def transient_bonus(rate: float) -> float:
+    """Energy added for `rate` onsets per second."""
+    return TRANSIENT_BONUS * min(max(rate, 0.0) / TRANSIENT_FULL_RATE, 1.0)
+
+
+def loudness(rms_db: float, floor_db: float | None = None) -> float:
+    """0..1 loudness of one block: relative to `floor_db`, or on the fixed scale without one."""
+    if floor_db is None:
+        loud = (rms_db - ENERGY_FLOOR_DB) / (ENERGY_CEIL_DB - ENERGY_FLOOR_DB)
+    elif rms_db > ENERGY_CEIL_DB:
+        loud = 1.0
+    else:
+        loud = (rms_db - floor_db - FLOOR_MARGIN_DB) / RELATIVE_SPAN_DB
+    return float(np.clip(loud, 0.0, 1.0))
+
+
+def classify_vector(energy: float, voices: float, rhythm: float, saturated: bool,
+                    transients: float = 1.0) -> MoodName:
+    """Named state for one mood vector. rhythm is accepted for future rules but unused.
+
+    `transients` is the block's onset rate; the default assumes there were some.
+    """
     if saturated or energy > LOUD_ENERGY:
         return MoodName.LOUD_BUSY
     if voices >= CONVERSATION_VOICES:
         return MoodName.CONVERSATION
     if energy < EMPTY_ENERGY and voices < EMPTY_VOICES:
         return MoodName.EMPTY
-    return MoodName.COOKING
+    if transients >= COOKING_TRANSIENTS or energy - transient_bonus(transients) >= COOKING_LOUDNESS:
+        return MoodName.COOKING
+    return MoodName.EMPTY
 
 
-def raw_vector(f: Features) -> tuple[float, float, float]:
-    """(energy, voices, rhythm) for one block, before smoothing."""
-    loud = (f.rms_db - ENERGY_FLOOR_DB) / (ENERGY_CEIL_DB - ENERGY_FLOOR_DB)
-    bonus = TRANSIENT_BONUS * min(max(f.transient_rate, 0.0) / TRANSIENT_FULL_RATE, 1.0)
-    energy = float(np.clip(np.clip(loud, 0.0, 1.0) + bonus, 0.0, 1.0))
+def raw_vector(f: Features, floor_db: float | None = None) -> tuple[float, float, float]:
+    """(energy, voices, rhythm) for one block, before smoothing. See the module docstring."""
+    energy = min(loudness(f.rms_db, floor_db) + transient_bonus(f.transient_rate), 1.0)
     crowd = float(np.clip((f.talkers - 1.0) / (CROWD_TALKERS - 1.0), 0.0, 1.0))
     voices = float(np.clip(f.speech, 0.0, 1.0)) * (SINGLE_TALKER_VOICES
                                                     + (1.0 - SINGLE_TALKER_VOICES) * crowd)
@@ -112,11 +150,27 @@ class MoodTracker:
         self._name = MoodName.EMPTY
         self._pending: MoodName | None = None
         self._pending_count = 0
+        self._levels: deque[float] = deque(maxlen=FLOOR_BLOCKS)
+        self._logged_floor: float | None = None
+
+    @property
+    def floor_db(self) -> float | None:
+        """The learned quiet floor in dBFS, or None before the first block."""
+        return max(min(self._levels), ENERGY_FLOOR_DB) if self._levels else None
+
+    def _track_floor(self, rms_db: float) -> float:
+        self._levels.append(rms_db)
+        floor = max(min(self._levels), ENERGY_FLOOR_DB)
+        if self._logged_floor is None or abs(floor - self._logged_floor) > FLOOR_LOG_STEP_DB:
+            log.info("mood: quiet floor %.1f dBFS", floor)
+            self._logged_floor = floor
+        return floor
 
     def update(self, features: Features, lock: LockState) -> Mood:
-        raw = raw_vector(features)
+        raw = raw_vector(features, self._track_floor(features.rms_db))
         saturated = lock.status == LockStatus.SATURATED
-        candidate = classify_vector(*raw, saturated=saturated)
+        candidate = classify_vector(*raw, saturated=saturated,
+                                    transients=features.transient_rate)
         self._blocks.append(_Block(raw, candidate))
 
         values = np.array([b.vector for b in self._blocks])

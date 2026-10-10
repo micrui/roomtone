@@ -5,7 +5,8 @@
     roomtone bench marker            listen for the marker under a pad, then alone
     roomtone bench midi              notes, a CC sweep and clock to the M8
     roomtone baseline                record the empty-house room response
-    roomtone run [--sim]             the whole loop (--sim needs no hardware)
+    roomtone run [--sim]             the whole loop (--sim needs no hardware;
+                                     --script sets what the simulated kitchen does)
 
 The bench commands follow the day-one checks in docs/SPEC.md section 11.
 Anything that needs hardware or an optional package says so and exits,
@@ -20,11 +21,12 @@ import importlib
 import logging
 import sys
 from types import ModuleType
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
 from roomtone import audio as audio_mod
+from roomtone import kitchen
 from roomtone.config import CONTROL_MAP_CHANNEL, Config, MarkerParams
 from roomtone.types import BlockResult, db
 
@@ -223,11 +225,19 @@ def cmd_baseline(args: argparse.Namespace) -> int:
 # run -------------------------------------------------------------------------
 
 class _PrintPublisher:
-    """One console line per block, for runs without the TUI."""
+    """One console line per block, for runs without the TUI.
+
+    With `phase_at` (the simulated kitchen's script), each line also says which
+    phase the script was in when the block started.
+    """
+
+    def __init__(self, phase_at: Callable[[float], str] | None = None) -> None:
+        self.phase_at = phase_at
 
     def publish(self, r: BlockResult) -> None:
         c = r.controls
-        print(f"[{r.index:4d}] t={r.t_start:7.1f}s  lock={r.lock.status.value:<10} "
+        phase = f"phase={self.phase_at(r.t_start):<8} " if self.phase_at else ""
+        print(f"[{r.index:4d}] t={r.t_start:7.1f}s  {phase}lock={r.lock.status.value:<10} "
               f"mood={r.mood.name.value:<12} energy={c.energy:.2f} voices={c.voices:.2f} "
               f"rhythm={c.rhythm:.2f} layers={c.layers:08b} {c.scale} {c.tempo_bpm:.0f} BPM  "
               f"raw {r.raw_rms_db:.1f} dB, residual {r.residual_rms_db:.1f} dB", flush=True)
@@ -248,8 +258,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     cfg = _config(args)
     marker, lock = mods["marker"], mods["lock"]
     source = MarkerSource(marker.MarkerScheduler(cfg.marker, cfg.sample_rate), cfg.marker)
-    backend: Any = (audio_mod.SimBackend(cfg, realtime=not args.fast) if args.sim
-                    else audio_mod.SoundDeviceBackend(cfg))
+    backend: Any = (audio_mod.SimBackend(cfg, realtime=not args.fast,
+                                         script=args.script or kitchen.DEFAULT_SCRIPT)
+                    if args.sim else audio_mod.SoundDeviceBackend(cfg))
+    script = getattr(backend, "script", None)
     io = audio_mod.AudioIO(cfg, source, backend=backend)
     locker = lock.Locker(cfg)
     if args.baseline:
@@ -259,12 +271,14 @@ def cmd_run(args: argparse.Namespace) -> int:
         publishers.append(TidalPublisher(cfg.tidal_host, cfg.tidal_port))
     tui = _module("roomtone.tui", "the terminal display") if args.tui else None
     if tui is None:
-        publishers.append(_PrintPublisher())
+        publishers.append(_PrintPublisher(script.phase_at if script is not None else None))
     log = BlockLog(cfg.log_dir)
     engine = Engine(cfg, io, locker, mods["mood"].MoodTracker(cfg), Controller(cfg), publishers,
                     log=log, marker=source, extract=mods["features"].extract)
 
-    where = "the simulated kitchen" if args.sim else f"audio device {cfg.aggregate_device!r}"
+    where = (f"audio device {cfg.aggregate_device!r}" if not args.sim else
+             "the simulated kitchen" + (f" (script {kitchen.format_script(script.phases)})"
+                                        if script is not None else ""))
     print(f"roomtone: {where}, {cfg.block_seconds:g} s blocks, "
           f"Tidal {'off' if args.no_tidal else f'{cfg.tidal_host}:{cfg.tidal_port}'}, "
           f"TUI feed {cfg.tui_host}:{cfg.tui_port}, log {log.path}")
@@ -297,6 +311,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 
 
 # parser ----------------------------------------------------------------------
+
+def _script_arg(text: str) -> list[tuple[float, str]]:
+    try:
+        return kitchen.parse_script(text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from None
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="roomtone", description="Room-responsive ambient music.")
@@ -335,6 +356,10 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--no-tidal", action="store_true", help="do not send /ctrl to Tidal")
     b.add_argument("--tui", action="store_true", help="show the terminal display")
     b.add_argument("--fast", action="store_true", help="with --sim: run faster than real time")
+    b.add_argument("--script", type=_script_arg, metavar="MODE:SECONDS,...",
+                   help="with --sim: what the kitchen does, phase by phase, repeating; modes "
+                        f"{', '.join(kitchen.MODES)} (default "
+                        f"{kitchen.format_script(kitchen.DEFAULT_SCRIPT)})")
     b.add_argument("--blocks", type=int, help="stop after this many blocks")
     b.add_argument("--block-seconds", type=float, help="analysis block length (default from config)")
     b.add_argument("--log-dir", help="where session logs go (default from config)")

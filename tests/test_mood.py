@@ -40,6 +40,47 @@ def test_raw_vector_mapping():
     assert one[1] == pytest.approx(0.6) and crowd[1] == pytest.approx(0.8)
 
 
+def test_raw_vector_relative_to_floor():
+    assert raw_vector(Features(rms_db=-48.0), floor_db=-48.0)[0] == 0.0
+    assert raw_vector(Features(rms_db=-42.0), floor_db=-48.0)[0] == 0.0
+    assert raw_vector(Features(rms_db=-27.0), floor_db=-48.0)[0] == pytest.approx(0.5)
+    assert raw_vector(Features(rms_db=-19.0), floor_db=-10.0)[0] == 1.0   # loud whatever the floor
+
+
+def test_steady_hum_is_empty_without_onsets():
+    assert classify_vector(0.3, 0.0, 0.0, False, transients=0.0) is MoodName.EMPTY
+    assert classify_vector(0.3, 0.0, 0.0, False, transients=0.5) is MoodName.COOKING
+    assert classify_vector(0.36, 0.0, 0.0, False, transients=0.0) is MoodName.COOKING
+
+
+def test_noise_floor_stays_empty_and_clatter_cooks():
+    cfg = Config()
+    tracker = MoodTracker(cfg)
+    floor = Features(rms_db=-48.0, speech=0.05)
+    for _ in range(10):
+        mood = tracker.update(floor, LOCKED)
+        assert mood.name is MoodName.EMPTY
+    assert tracker.floor_db == pytest.approx(-48.0)
+    assert mood.energy == 0.0
+    clatter = Features(rms_db=-48.0, speech=0.05, transient_rate=3.0)   # energy 0.225
+    names = [tracker.update(clatter, LOCKED).name for _ in range(cfg.hysteresis_blocks)]
+    assert names == [MoodName.EMPTY] * (cfg.hysteresis_blocks - 1) + [MoodName.COOKING]
+
+
+def test_floor_follows_the_quietest_recent_block():
+    tracker = MoodTracker(Config())
+    assert tracker.floor_db is None
+    tracker.update(Features(rms_db=-40.0), LOCKED)
+    tracker.update(Features(rms_db=-50.0), LOCKED)
+    tracker.update(Features(rms_db=-30.0), LOCKED)
+    assert tracker.floor_db == pytest.approx(-50.0)
+    tracker.update(SILENT, LOCKED)
+    assert tracker.floor_db == pytest.approx(-60.0)   # digital silence is not a room
+    for _ in range(240):
+        tracker.update(Features(rms_db=-45.0), LOCKED)
+    assert tracker.floor_db == pytest.approx(-45.0)   # old quiet blocks age out
+
+
 def test_silence_then_speech():
     cfg = Config()
     tracker = MoodTracker(cfg)

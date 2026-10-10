@@ -25,7 +25,7 @@ import logging
 import math
 import threading
 import time
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, Sequence
 
 import numpy as np
 
@@ -270,6 +270,9 @@ class SimBackend:
     through a simulated room to make the mic channel.
 
     Uses roomtone.sim.SimRoom when present, otherwise a delayed copy plus noise.
+    The room's own sound is white noise at `room_noise_db`, or, given `script`
+    (a list of (seconds, mode) phases, see roomtone.kitchen), a scripted evening
+    over that same floor; `.script` is then the KitchenScript, None otherwise.
     The mic for each callback is the room's response to the previous callback's
     output, which adds one I/O block of latency, as real input buffering does.
     `realtime=False` runs as fast as the CPU allows (for tests and quick looks).
@@ -277,7 +280,8 @@ class SimBackend:
 
     def __init__(self, cfg: Config, delay_samples: int | None = None, drift_ppm: float = 20.0,
                  realtime: bool = True, room_noise_db: float = -60.0, seed: int = 0,
-                 max_frames: int | None = None):
+                 max_frames: int | None = None,
+                 script: Sequence[tuple[float, str]] | None = None):
         self.sample_rate = cfg.sample_rate
         self.delay_samples = (int(round(0.075 * cfg.sample_rate)) + 200
                               if delay_samples is None else int(delay_samples))
@@ -293,6 +297,13 @@ class SimBackend:
         except ImportError:
             log.info("roomtone.sim not available; simulating the room as a delayed copy plus noise")
             self.room = _DelayRoom(cfg.sample_rate, self.delay_samples, drift_ppm, seed=seed)
+        self.script: Any = None
+        if script is not None:
+            try:
+                from roomtone.kitchen import KitchenScript
+                self.script = KitchenScript(script, cfg.sample_rate, room_noise_db, seed=seed)
+            except ImportError:
+                log.info("roomtone.sim not available; the kitchen script is off, room sound is noise")
         self.frames_run = 0
         self._callback: StreamCallback | None = None
         self._thread: threading.Thread | None = None
@@ -317,7 +328,8 @@ class SimBackend:
         self._indata[:, self.m8_channels[1]] = pad[:, 1]
         self._indata[:, self.mic_channel] = self._pending_mic
         self._callback(self._indata, self._outdata, n, None, None)
-        room_sound = (self.room_noise * self._rng.standard_normal(n)).astype(np.float32)
+        room_sound = (self.script.next(n) if self.script is not None else
+                      (self.room_noise * self._rng.standard_normal(n)).astype(np.float32))
         self._pending_mic = np.asarray(
             self.room.render(self._outdata.mean(axis=1), room_sound), dtype=np.float32).reshape(-1)
         self.frames_run += n

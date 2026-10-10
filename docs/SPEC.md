@@ -5,6 +5,8 @@ Revision 2: M8 MIDI and USB audio facts vetted against the community M8 guide
 ("Interacting with other devices" chapter), section 10 updated accordingly.
 Revision 3: vetted against the official M8 Operation Manual v6.5.2 (2026-04-21):
 USB spec, bit depth, channel counts, MIDI mapping scope, sync options, track polyphony.
+Revision 4: built. Mixer moved into the Python process (8.3); analysis blocks are
+aligned to marker bursts; see README.md and docs/BENCH.md for the running system.
 
 ## 1. Goal and scope
 
@@ -268,9 +270,12 @@ control values, so a human edit and a room edit never collide.
 
 ### 8.3 Mixer
 
-SuperCollider as well (same server as SuperDirt): M8 input bus plus marker generator,
-summed to the output; writes the reference ring buffer and exposes marker parameters over
-OSC. One audio engine, one aggregate device, no inter-app audio plumbing.
+Revision 4 (build): the mixer lives in the Python process, not in SuperCollider. The
+`roomtone` audio callback reads the M8 pair and the mic from the aggregate device, adds
+the marker, writes the output, and stamps the reference and the mic into ring buffers
+with one shared frame counter. That keeps the reference and the mic in one clock domain
+in one process, which is what the lock needs. SuperCollider only runs SuperDirt for
+Tidal's MIDI output and needs no audio device of its own.
 
 USB audio, per the manual (USB Audio Class 1 and USB MIDI compliant, 24-bit):
 

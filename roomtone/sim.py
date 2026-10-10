@@ -192,13 +192,25 @@ def pad_like(seconds: float, sample_rate: int, t0: float = 0.0, rms_db: float = 
 
 
 def speech_like(seconds: float, sample_rate: int, rng: np.random.Generator,
-                rms_db: float = -20.0) -> np.ndarray:
-    """Talk stand-in: 300-3000 Hz noise in 4 Hz syllable bursts, grouped into phrases with pauses."""
+                rms_db: float = -20.0, syllable_hz: float = 4.0,
+                jitter: float = 0.0) -> np.ndarray:
+    """Talk stand-in: 300-3000 Hz noise in syllable bursts, grouped into phrases with pauses.
+
+    Syllables come at `syllable_hz` (4 per second by default). With `jitter` > 0
+    the rate wanders smoothly by up to that fraction either way (new target every
+    0.4 s), as a real talker speeds up and slows down.
+    """
     n = int(round(seconds * sample_rate))
     sos = butter(8, [300.0, 3000.0], btype="band", fs=sample_rate, output="sos")
     noise = sosfilt(sos, rng.standard_normal(n + sample_rate))[sample_rate:]
-    t = np.arange(n) / sample_rate
-    syllables = np.maximum(0.0, np.sin(2 * np.pi * 4.0 * t + rng.uniform(0, 2 * np.pi))) ** 1.5
+    phase0 = rng.uniform(0, 2 * np.pi)
+    if jitter > 0.0:
+        knots = rng.uniform(-1.0, 1.0, int(seconds / 0.4) + 2)
+        wander = np.interp(np.arange(n) / (0.4 * sample_rate), np.arange(len(knots)), knots)
+        angle = phase0 + 2 * np.pi * np.cumsum(syllable_hz * (1.0 + jitter * wander)) / sample_rate
+    else:
+        angle = phase0 + 2 * np.pi * syllable_hz * np.arange(n) / sample_rate
+    syllables = np.maximum(0.0, np.sin(angle)) ** 1.5
     gate = np.zeros(n)
     pos, talking = 0, bool(rng.integers(2))
     while pos < n:
@@ -210,15 +222,30 @@ def speech_like(seconds: float, sample_rate: int, rng: np.random.Generator,
     return _rms_scale(noise * (0.15 + 0.85 * syllables) * gate, rms_db).astype(np.float32)
 
 
+_CLICK_TAU_S = (0.002, 0.015)
+# mean energy of one click per sample of decay time: E[10 ** (2u)] for u uniform
+# on (-1, 0), times the mean decay constant, times the 1/2 from integrating exp(-2t/tau)
+_CLICK_ENERGY_S = (1.0 - 0.01) / (2.0 * np.log(10.0)) * np.mean(_CLICK_TAU_S) / 2.0
+
+
 def clatter(seconds: float, sample_rate: int, rng: np.random.Generator, rate_hz: float,
-            rms_db: float = -20.0) -> np.ndarray:
+            rms_db: float = -20.0, normalise: bool = True) -> np.ndarray:
     """Kitchen-clatter stand-in: clicks at random times (about rate_hz per second),
-    each a burst of broadband noise dying away in a few milliseconds."""
+    each a burst of broadband noise dying away in a few milliseconds.
+
+    By default the result is scaled to exactly `rms_db`. With `normalise=False`
+    each click keeps a fixed scale chosen so that rms_db is the long-run level
+    at rate_hz, which keeps sparse clatter cut into short pieces from making
+    one lone click as loud as a whole stretch of them.
+    """
     n = int(round(seconds * sample_rate))
     x = np.zeros(n)
     for start in rng.integers(0, n, rng.poisson(rate_hz * seconds)):
-        tau = rng.uniform(0.002, 0.015)
+        tau = rng.uniform(*_CLICK_TAU_S)
         k = min(int(6 * tau * sample_rate), n - start)
         env = np.exp(-np.arange(k) / (tau * sample_rate))
         x[start:start + k] += 10.0 ** rng.uniform(-1.0, 0.0) * env * rng.standard_normal(k)
-    return _rms_scale(x, rms_db).astype(np.float32)
+    if normalise:
+        return _rms_scale(x, rms_db).astype(np.float32)
+    gain = 10.0 ** (rms_db / 20.0) / np.sqrt(max(rate_hz, 1e-9) * _CLICK_ENERGY_S)
+    return (gain * x).astype(np.float32)

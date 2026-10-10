@@ -103,6 +103,21 @@ def test_run_sim_fast_blocks(no_sounddevice, monkeypatch, tmp_path, capsys):
     assert "simulated kitchen" in out and "[   1]" in out
 
 
+def test_run_sim_prints_the_script_phase(no_sounddevice, monkeypatch, tmp_path, capsys):
+    install_fake_modules(monkeypatch)
+    rc = cli.main(["run", "--sim", "--fast", "--no-tidal", "--blocks", "2", "--block-seconds",
+                   "0.5", "--script", "party:0.5,empty:0.5", "--log-dir", str(tmp_path)])
+    assert rc == 0
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith("[")]
+    assert "phase=party" in lines[0] and "phase=empty" in lines[1]
+
+
+def test_run_rejects_a_bad_script(capsys):
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["run", "--sim", "--script", "empty:10,disco:5"])
+    assert exc.value.code == 2 and "disco" in capsys.readouterr().err
+
+
 def test_run_sim_tui_missing_falls_back_to_console(no_sounddevice, monkeypatch, tmp_path, capsys):
     install_fake_modules(monkeypatch)
     monkeypatch.setitem(sys.modules, "roomtone.sim", None)
