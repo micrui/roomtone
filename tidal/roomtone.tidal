@@ -1,0 +1,276 @@
+-- roomtone.tidal
+--
+-- The live-coding surface for roomtone. Evaluate the blocks in order, top to
+-- bottom, one block at a time (blocks are separated by blank lines; most
+-- Tidal editors evaluate "the block under the cursor" with Ctrl-Enter or
+-- Shift-Enter).
+--
+-- Written for Tidal 1.9 with the default BootTidal.hs (which defines d1..d16,
+-- setcps, once and hush) and SuperDirt booted from sc/startup.scd (which
+-- registers the M8 as the SuperDirt sound "midi").
+--
+-- What talks to what:
+--   roomtone (Python) --OSC /ctrl, port 6010--> Tidal (this file)
+--   Tidal --OSC--> SuperDirt --USB MIDI--> M8 Model:02
+--
+-- The room never edits this file. It only changes control values, which the
+-- patterns read with cF / cS. You can edit anything here while it plays; a
+-- human edit and a room edit never collide.
+--
+-- Control keys the Controller publishes (roomtone/types.py, Controls):
+--   energy, voices, rhythm, bright   0..1
+--   layers                           bitmask as a float, bit 0 = drone
+--   tempo_bpm                        beats per minute (default 60)
+--   scale                            string: open | pentatonic | minor | lydian
+--   transpose                        semitones, sent as a float
+--   layer_drone .. layer_spare       0 or 1, one per layer
+--
+-- MIDI plan (roomtone/config.py, LAYER_CHANNELS and CC):
+--   d1 drone   ch 1   d2 pad     ch 2   d3 figure  ch 3   d4 phrases ch 4
+--   d5 shimmer ch 5   d6 pulse   ch 6   d7 bass    ch 7   d8 spare   ch 8
+--   d9  tempo CC (CC 20) on ch 10, the M8's CONTROL MAP CHANNEL
+--   d10 mood CCs (cutoffs, volumes, sends, main EQ) on ch 10
+--   Channel 9 is the M8's default Rec Note Channel: nothing here uses it.
+--   SuperDirt's midichan is 0-based: MIDI channel 1 = midichan 0,
+--   channel 10 = midichan 9.
+--
+-- Pitch: SuperDirt turns `note 0` into MIDI note 60. `note (-12)` is MIDI 48.
+--
+-- Velocity: SuperDirt's MIDI output turns `amp` (0..1) into note velocity
+-- (amp x 127). If your SuperDirt version reads `velocity` instead, replace
+-- `amp` with `velocity` in the `vel` helper below; nothing else changes.
+-- Check on the bench that the M8 responds to velocity at all (m8/SETUP.md);
+-- if it does not, loudness still follows the room through the *_vol CCs.
+--
+-- How the layer gate works, and why it is "next onset", not "next bar":
+--   Each layer is wrapped in `layerGate`, which is `mask` driven by
+--   `layer_<name>` > 0.5. No randomness is involved (no degradeBy in the
+--   gate), so a layer is either fully on or fully off.
+--   Tidal reads control values at the moment it schedules an event (about
+--   20 times a second), not once per bar, and a pattern has no memory of what
+--   the value was at the start of the bar. So a gate change takes effect at
+--   that layer's next note onset. Drone, pad, bass and phrases start their
+--   notes on cycle (bar) boundaries, so for them the change lands on a bar
+--   line. Figure, shimmer and pulse have notes inside the bar, so for them it
+--   lands on the next note. The Controller changes layer_* only after its
+--   3-block hysteresis (minutes apart), so this is rarely audible. A strict
+--   bar lock would need the Controller to know Tidal's cycle phase; that is
+--   deferred.
+--
+-- Slew: Tidal patterns are stateless, so they cannot glide from an old
+-- control value to a new one by themselves. The Controller already slews
+-- every continuous control over 30 to 120 s (docs/SPEC.md section 7) before
+-- publishing it. The CC patterns below use `segment 8` to send 8 updates per
+-- cycle, which turns those slow ramps and the slow LFO into small CC steps.
+
+
+-- 1. Tidal's own clock ---------------------------------------------------------
+-- One cycle = one bar of 4 beats. At 60 BPM: 60/60/4 = 0.25 cycles per second,
+-- so one cycle lasts 4 s. That is why the loop lengths below are written as
+-- seconds divided by 4: `slow (17.8/4)` gives a 17.8 s loop at this rate.
+-- The room's tempo_bpm does NOT change this line (setcps is not driven by a
+-- pattern). tempo_bpm goes to the M8's song TEMPO as CC 20 instead (d9), so it
+-- moves the M8's tempo-synced LFOs and delay times while the loop lengths here
+-- stay fixed in seconds. To change Tidal's tempo by hand, edit and re-evaluate:
+setcps (60/60/4)
+
+
+-- 2. Helpers. Evaluate this whole block once (it is one `let`). -----------------
+-- If one line fails to compile, the whole block fails; the error names the line.
+let energy   = cF 0   "energy"    :: Pattern Double
+    voices   = cF 0   "voices"    :: Pattern Double
+    rhythm   = cF 0   "rhythm"    :: Pattern Double
+    bright   = cF 0.3 "bright"    :: Pattern Double
+    tempoBpm = cF 60  "tempo_bpm" :: Pattern Double
+    -- The Controller's scale names mapped to Tidal scale names.
+    -- "open" -> ritusen (0 2 5 7 9: no third, so it sounds open).
+    -- "pentatonic" -> majPent (0 2 4 7 9). Any other string is passed through,
+    -- so the Controller (or you) can send a native Tidal name such as "dorian".
+    -- Tidal falls back to a scale of [0] for unknown names, which collapses
+    -- every degree onto the root, so keep this map in step with types.py.
+    scaleFor :: String -> String
+    scaleFor "open"       = "ritusen"
+    scaleFor "pentatonic" = "majPent"
+    scaleFor "minor"      = "minor"
+    scaleFor "lydian"     = "lydian"
+    scaleFor other        = other
+    roomScale = fmap scaleFor (cS "open" "scale") :: Pattern String
+    -- Global transpose in whole semitones, added to every pitched layer.
+    transposeN = fmap (\t -> fromIntegral (round t :: Int)) (cF 0 "transpose") :: Pattern Note
+    -- tonal: scale degrees in the room's scale, plus transpose, plus an octave offset.
+    -- `|+` keeps the rhythm of the left pattern (the notes) and only adds values.
+    tonal oct degrees = (scale roomScale degrees |+ transposeN) |+ oct
+    -- semis: raw semitone offsets (not scale degrees), plus transpose and octave.
+    semis oct offsets = (offsets |+ transposeN) |+ oct
+    -- The macro cycle: a sine from 0 to 1 and back over 64 cycles
+    -- (256 s at 60 BPM), independent of the room, so the piece breathes even
+    -- when the kitchen does not change.
+    macro = slow 64 sine :: Pattern Double
+    clamp01 = fmap (max 0 . min 1) :: Pattern Double -> Pattern Double
+    -- layerGate default name: passes the pattern through while layer_<name> > 0.5.
+    -- The default applies until the Controller first publishes the key; drone
+    -- defaults on and the rest off, matching Controls.layers = 0b00000001.
+    layerGate :: Double -> String -> ControlPattern -> ControlPattern
+    layerGate dflt name = mask (fmap (> 0.5) (cF dflt ("layer_" ++ name)))
+    -- vel lo hi duck: velocity rises from lo to hi with energy, drops by up to
+    -- `duck` (a fraction) when voices are present, and breathes with the macro.
+    vel :: Pattern Double -> Pattern Double -> Pattern Double -> ControlPattern
+    vel lo hi duck = amp (clamp01 (range lo hi energy * (1 - duck * voices) * (0.85 + 0.15 * macro)))
+    -- toCC: 0..1 -> whole numbers 0..127, clipped.
+    toCC :: Pattern Double -> Pattern Double
+    toCC = fmap (\x -> fromIntegral (round (127 * max 0 (min 1 x)) :: Int))
+    -- moodCC number value: a CC stream, 8 updates per cycle. ccv comes first so the
+    -- 8-per-cycle rhythm of `segment` is the structure that gets sent.
+    moodCC :: Pattern Double -> Pattern Double -> ControlPattern
+    moodCC num value = ccv (segment 8 (toCC value)) # ccn num
+
+
+-- 3. The eight layers ----------------------------------------------------------
+-- Pattern shape, the same for every layer:
+--   layerGate <default> "<name>"            -- on/off from layer_<name>
+--   $ slow (<seconds>/4) ( <notes> )        -- one long loop per layer
+--   # vel <lo> <hi> <duck>                  -- velocity from energy and voices
+--   # legato <fraction>                     -- note length as a share of the step
+--   # s "midi" # midichan <channel - 1>     -- the M8 track for this layer
+-- Loop lengths (17.8, 21.3, 25.1, 31.7, 13.3, 37.9, 43.1 s) share no simple
+-- ratio, so the layers drift against each other and rarely line up the same
+-- way twice. legato stays just under 1 on held notes so a note-off never lands
+-- after the next note-on of the same pitch on a MONO track.
+
+-- d1 drone: track 1, Macrosynth. Root, now and then the fifth (7 semitones,
+-- which every scale in scaleFor contains). One note per 17.8 s loop.
+d1 $ layerGate 1 "drone"
+   $ slow (17.8/4) (note (semis (-12) "<0 0 0 7>"))
+   # vel 0.35 0.7 0.3
+   # legato 0.98
+   # s "midi" # midichan 0
+
+-- d2 pad: track 2, Hypersynth. One note in gives the instrument's chord, so
+-- this sends single scale degrees and the M8 builds the chord.
+d2 $ layerGate 0 "pad"
+   $ slow (21.3/4) (note (tonal (-12) "<0 3 5 2 4>"))
+   # vel 0.3 0.6 0.4
+   # legato 0.95
+   # s "midi" # midichan 1
+
+-- d3 figure: track 3, FM bells. Density follows energy; the voices rule thins
+-- it further and lowers its velocity the most (duck 0.6) when people talk.
+d3 $ layerGate 0 "figure"
+   $ slow (25.1/4)
+       ( degradeBy (clamp01 (0.7 - 0.6 * energy + 0.5 * voices))
+       $ note (tonal 0 "0 ~ 2 ~ 4 ~ ~ 7 ~ 4 ~ ~ 2 ~ 1 ~") )
+   # vel 0.25 0.65 0.6
+   # legato 0.5
+   # s "midi" # midichan 2
+
+-- d4 phrases: track 4, Sampler with recorded phrases. Two triggers per 31.7 s
+-- loop. note 0 plays the sample at its root pitch; transpose shifts it with
+-- the key so tonal phrases stay in key.
+d4 $ layerGate 0 "phrases"
+   $ slow (31.7/4)
+       ( degradeBy (clamp01 (0.5 - 0.3 * energy + 0.4 * voices))
+       $ note (semis 0 "0 ~ ~ ~ ~ 0 ~ ~") )
+   # vel 0.3 0.6 0.5
+   # legato 0.98
+   # s "midi" # midichan 3
+
+-- d5 shimmer: track 5, FM, high register. Brighter rooms get more shimmer;
+-- sometimes a note drops an octave.
+d5 $ layerGate 0 "shimmer"
+   $ slow (13.3/4)
+       ( degradeBy (clamp01 (0.8 - 0.4 * bright - 0.3 * energy))
+       $ sometimesBy (0.3 * bright) (|- note 12)
+       $ note (tonal 24 "0 4 ~ 2 ~ 7 ~ ~") )
+   # vel 0.2 0.5 0.4
+   # legato 0.5
+   # s "midi" # midichan 4
+
+-- d6 pulse: track 6, Sampler, soft percussion. The only layer at the real bar
+-- length, so it keeps time. rhythm sets how many hits survive: none at
+-- rhythm 0, all at rhythm 1. Not transposed (percussion).
+d6 $ layerGate 0 "pulse"
+   $ degradeBy (clamp01 (1 - rhythm))
+   $ note "0 ~ ~ 0 ~ ~ 0 ~"
+   # vel 0.2 0.55 0.5
+   # legato 0.25
+   # s "midi" # midichan 5
+
+-- d7 bass: track 7, Macrosynth. "~" inside < > rests for a whole loop step.
+d7 $ layerGate 0 "bass"
+   $ slow (37.9/4) (note (tonal (-24) "<0 ~ 3 ~ 4 0 ~>"))
+   # vel 0.35 0.65 0.2
+   # legato 0.9
+   # s "midi" # midichan 6
+
+-- d8 spare: track 8, Sampler. Reserved for the musical marker later; until
+-- then a sparse high line you can rewrite freely.
+d8 $ layerGate 0 "spare"
+   $ slow (43.1/4)
+       ( degradeBy (clamp01 (0.6 - 0.4 * energy))
+       $ note (tonal 12 "0 ~ ~ 4 ~ ~ ~ ~") )
+   # vel 0.2 0.5 0.5
+   # legato 0.5
+   # s "midi" # midichan 7
+
+
+-- 4. Tempo to the M8 (CC 20 on channel 10) --------------------------------------
+-- The M8 maps CC 20 to song TEMPO in Project View (m8/SETUP.md). Calibrate
+-- that mapping so CC 0 = 40 BPM and CC 127 = 167 BPM: then one CC step is
+-- exactly 1 BPM and the CC value is simply BPM minus 40. Change the 40 and 127
+-- here if you calibrate a different span (low end, and high minus low).
+d9 $ moodCC 20 ((tempoBpm - 40) / 127)
+   # s "midi" # midichan 9
+
+
+-- 5. Mood CCs (channel 10) --------------------------------------------------------
+-- Every expression inside moodCC is a 0..1 value built from the room controls
+-- and the macro LFO; toCC clips it and scales it to 0..127. The numbers are
+-- starting points to tune by ear, not measurements. What each CC moves on the
+-- M8 is set by MIDI learn and by the MIN/MAX range in MIDI Mapping View; keep
+-- those ranges narrow so 128 steps cover a small span (CC sweeps can sound
+-- steppy, docs/SPEC.md section 8.1).
+d10 $ stack
+    [ moodCC 30 (0.2 + 0.6 * bright + 0.2 * macro)                          -- drone_cutoff
+    , moodCC 31 (0.15 + 0.5 * bright + 0.25 * slow 64 (0.25 ~> sine))       -- pad_cutoff, LFO a quarter turn later
+    , moodCC 32 (0.1 + 0.7 * bright - 0.2 * voices)                         -- figure_cutoff, darker under speech
+    , moodCC 33 (0.2 + 0.6 * bright + 0.2 * macro)                          -- shimmer_cutoff
+    , moodCC 40 (0.55 + 0.25 * energy - 0.25 * voices)                      -- drone_vol
+    , moodCC 41 (0.5 + 0.3 * energy - 0.3 * voices)                         -- pad_vol
+    , moodCC 42 (0.35 + 0.4 * energy - 0.35 * voices)                       -- figure_vol
+    , moodCC 43 (0.35 + 0.35 * energy - 0.4 * voices)                       -- phrases_vol
+    , moodCC 44 (0.3 + 0.3 * energy - 0.2 * voices + 0.1 * macro)           -- shimmer_vol
+    , moodCC 45 (0.2 + 0.4 * rhythm + 0.2 * energy - 0.2 * voices)          -- pulse_vol
+    , moodCC 46 (0.45 + 0.35 * energy - 0.15 * voices)                      -- bass_vol
+    , moodCC 47 (0.4 + 0.2 * energy)                                        -- spare_vol
+    , moodCC 50 (0.75 - 0.4 * energy - 0.2 * voices)                        -- reverb_send: wetter when calm, drier under speech
+    , moodCC 51 (0.2 + 0.4 * rhythm * (1 - voices))                         -- delay_send: follows rhythm, backs off under speech
+    , moodCC 52 (0.5 - 0.35 * voices)                                       -- main_eq_mid_gain: 0.5 (CC 64) = flat, cuts mids under speech
+    ] # s "midi" # midichan 9
+
+
+-- 6. Optional lines (commented out) ----------------------------------------------
+--
+-- Transpose on the M8 instead of in Tidal (CC 21 -> Project View TRANSPOSE,
+-- calibrated so CC 64 = 0 and one step = one semitone). Use ONE path only:
+-- if you enable this, also change transposeN in the let block to `pure 0`,
+-- or every note is transposed twice.
+-- d11 $ moodCC 21 ((cF 0 "transpose" + 64) / 127) # s "midi" # midichan 9
+--
+-- MIDI clock for the M8's SYNC IN = CLOCK (24 ticks per quarter note,
+-- 4 quarters per cycle = 96 ticks per cycle). This ties the M8's tempo to
+-- Tidal's setcps, not to tempo_bpm, so do not run it together with d9.
+-- d12 $ midicmd "midiClock*96" # s "midi"
+-- once $ midicmd "start" # s "midi"
+--
+-- Reading the `layers` bitmask directly instead of layer_<name> (bit i is on
+-- when the integer part divided by 2^i is odd):
+--   mask (fmap (\m -> odd ((floor m :: Int) `div` (2 ^ 3))) (cF 1 "layers"))
+--
+-- Live-coding examples (evaluate on their own line):
+-- d3 $ silence                              -- stop one layer until re-evaluated
+-- once $ note 0 # s "midi" # midichan 0     -- one test note on track 1
+-- once $ ccv 64 # ccn 30 # s "midi" # midichan 9   -- one CC, for MIDI learn
+--
+-- Stop everything. hush stops new notes; notes already sounding end when
+-- their scheduled note-offs arrive:
+-- hush
