@@ -111,10 +111,15 @@ class Config:
     tidal_port: int = TIDAL_CTRL_PORT
     tui_host: str = TUI_HOST
     tui_port: int = TUI_PORT
-    # device names as sounddevice reports them; None = system default
-    m8_input_device: str | None = "M8"
-    mic_input_device: str | None = None
-    output_device: str | None = None
+    # Device names as CoreAudio and sounddevice report them (case-insensitive
+    # substring, exact name preferred). The three members build `aggregate_device`
+    # with `roomtone aggregate create`; the stream itself opens the aggregate.
+    # Defaults are the laptop rig: M8 over USB, the MacBook's own mic and
+    # speakers. For the kitchen rig name the measurement mic and the headphone
+    # output here instead (docs/BENCH.md steps 2 and 3).
+    m8_input_device: str = "M8"
+    mic_input_device: str = "MacBook Air Microphone"
+    output_device: str = "MacBook Air Speakers"
     aggregate_device: str | None = "roomtone"
     midi_out_port: str | None = "M8"
     log_dir: str = "logs"

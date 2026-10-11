@@ -296,3 +296,16 @@ def test_room_change_goes_lost_then_relocks():
     assert all(s == LockStatus.LOCKED for s in statuses[relock:])
     assert log[-1].state.erle_db >= 20.0
     assert log[-1].state.marker_rung == 0
+
+
+def test_baseline_file_refuses_nothing_and_validates_on_load(tmp_path):
+    from roomtone.lock import load_baseline, save_baseline
+    path = tmp_path / "b.npy"
+    with pytest.raises(ValueError, match="never found"):
+        save_baseline(path, None)
+    assert not path.exists() and load_baseline(path) is None
+    save_baseline(path, np.arange(5, dtype=np.float32))
+    assert load_baseline(path).tolist() == [0, 1, 2, 3, 4]
+    np.save(path, np.asarray(None))  # what the old code wrote when it never locked
+    with pytest.raises(ValueError, match="does not hold a room response"):
+        load_baseline(path)

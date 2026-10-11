@@ -247,6 +247,10 @@ def acquire_baseline(cfg: Config, audio: AudioIO, locker: Any, marker: Any, seco
                      poll_s: float = 0.05, stop: threading.Event | None = None) -> Any:
     """Feed the Locker marker-only blocks for `seconds` and return its room response.
 
+    Blocks are aligned to marker bursts and the Locker is told which parameters
+    each burst used, exactly as `Engine.step` does: the baseline marker is longer
+    and louder than the default, and a Locker left to assume its own parameters
+    would regenerate a different sequence and never find it.
     The audio stream must already be running. Returns `locker.rir`.
     """
     block_frames = int(round(cfg.block_seconds * cfg.sample_rate))
@@ -255,14 +259,21 @@ def acquire_baseline(cfg: Config, audio: AudioIO, locker: Any, marker: Any, seco
     stop = stop or threading.Event()
     done = 0
     while done < blocks and not stop.is_set():
+        emissions = list(marker.emissions)
+        i = bisect.bisect_left(emissions, reader.next_start)
+        if i >= len(emissions):
+            stop.wait(poll_s)
+            continue
+        reader.next_start = emissions[i]
         block = reader.next()
         if block is None:
             stop.wait(poll_s)
             continue
         start, reference, mic = block
-        _, lock = locker.process(reference, mic,
-                                 emission_in(marker.emissions, start, start + block_frames))
+        emitted = list(getattr(marker, "emitted_params", []))
+        params = emitted[i] if i < len(emitted) else getattr(marker, "params", None)
+        _, lock = locker.process(reference, mic, start, params=params)
         done += 1
-        logger.info("baseline block %d/%d: lock %s, delay %.1f samples",
-                 done, blocks, lock.status.value, lock.delay_samples)
+        logger.info("baseline block %d/%d: lock %s, delay %.1f samples, psr %.1f dB",
+                    done, blocks, lock.status.value, lock.delay_samples, lock.peak_to_sidelobe_db)
     return locker.rir

@@ -8,7 +8,7 @@ from roomtone.config import Config, MarkerParams
 from roomtone.control import Controller
 from roomtone.engine import Engine, MarkerSource, acquire_baseline, emission_in
 from roomtone.log import BlockLog
-from roomtone.types import BlockResult, LockStatus, MoodName
+from roomtone.types import BlockResult, LockState, LockStatus, MoodName
 from tests.fakes import FakeLocker, FakeMoodTracker, FakeScheduler, fake_extract, fake_scale
 
 SR, IO, BLOCK_S = 8000, 200, 0.5
@@ -137,3 +137,20 @@ def test_marker_source_scales_to_music():
     assert block.max() == pytest.approx(0.05)
     fixed = MarkerSource(FakeScheduler(params, SR), params, fixed_rms=1.0)
     assert fixed(100, 0.0).max() == pytest.approx(0.1)
+
+
+def test_acquire_baseline_aligns_to_bursts_and_passes_their_params(tmp_path, rng):
+    """The baseline marker is not the Locker's default; the Locker must be told."""
+    cfg, backend, io, _, scheduler, _, _ = rig(tmp_path)
+
+    class RecordingLocker(FakeLocker):
+        def process(self, reference, mic, emission_start, params=None):
+            self.calls.append((emission_start, params))
+            return mic, LockState(status=LockStatus.ACQUIRING)
+
+    locker = RecordingLocker()
+    pump(backend, 3 * BLOCK, rng)
+    acquire_baseline(cfg, io, locker, io.marker_source, seconds=2 * BLOCK_S)
+    starts = [s for s, _ in locker.calls]
+    assert starts == scheduler.emissions[:2] and starts[1] - starts[0] == BLOCK
+    assert all(p is scheduler.params for _, p in locker.calls)

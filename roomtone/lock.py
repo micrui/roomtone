@@ -365,15 +365,33 @@ def rir_change(a: np.ndarray, b: np.ndarray) -> float:
 # Baseline ---------------------------------------------------------------------
 
 def save_baseline(path: str | Path, rir: np.ndarray) -> None:
-    """Store a quiet-house room response to start future sessions from."""
+    """Store a quiet-house room response to start future sessions from.
+
+    Refuses None or an empty response: the Locker never found the marker, and a
+    file of nothing would only fail later, at load time.
+    """
+    h = None if rir is None else np.asarray(rir, dtype=np.float64)
+    if h is None or h.ndim != 1 or h.size == 0:
+        raise ValueError("no room response to save: the marker was never found")
     with open(path, "wb") as f:
-        np.save(f, np.asarray(rir, dtype=np.float64))
+        np.save(f, h)
 
 
 def load_baseline(path: str | Path) -> np.ndarray | None:
-    """The stored baseline response, or None if there is none yet."""
+    """The stored baseline response, or None if there is none yet.
+
+    Raises ValueError for a file that is not a one-dimensional response.
+    """
     p = Path(path)
-    return np.load(p) if p.exists() else None
+    if not p.exists():
+        return None
+    try:
+        h = np.load(p, allow_pickle=False)
+    except ValueError as exc:  # an object array: what an earlier build saved when it never locked
+        raise ValueError(f"{p} does not hold a room response ({exc})") from None
+    if h.ndim != 1 or h.size == 0 or not np.issubdtype(h.dtype, np.floating):
+        raise ValueError(f"{p} does not hold a room response (shape {h.shape}, {h.dtype})")
+    return h.astype(np.float64)
 
 
 # The Locker -------------------------------------------------------------------

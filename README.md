@@ -73,13 +73,14 @@ macOS, Python 3.11 or newer.
    [tidalcycles.org](https://tidalcycles.org). The default BootTidal.hs is enough;
    `tidal/roomtone.tidal` needs nothing extra from it.
 4. The M8 configured per [m8/SETUP.md](m8/SETUP.md), and the bench checks in
-   [docs/BENCH.md](docs/BENCH.md) done once (they build the aggregate device and record the
-   empty-house baseline).
+   [docs/BENCH.md](docs/BENCH.md) done once (they build the aggregate device with
+   `roomtone aggregate create` and record the empty-house baseline).
 
 ## Run order
 
 1. Plug in the M8, the mic and the headphone cable to the Five. The aggregate device
-   "roomtone" picks them up (docs/BENCH.md step 3).
+   "roomtone" picks them up (`roomtone aggregate show` lists its members; docs/BENCH.md
+   step 3 builds it).
 2. Start SuperDirt with MIDI out to the M8:
 
    ```

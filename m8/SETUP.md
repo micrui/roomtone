@@ -26,6 +26,11 @@ instrument whether or not the sequencer runs, so the Mac is the only sequencer. 
    your Tidal editor. Do not start d1..d10 yet; you send single messages with `once`.
 3. A note of the M8's firmware version (step 1.1). The settings below are documented in the
    6.5.2 manual. Update first if yours is older.
+4. The M8's built-in speaker silent whenever the mic is live: plug headphones (or nothing
+   that plays) into its jack, or turn the speaker off in System Settings if your firmware
+   has that option. roomtone subtracts only what the Mac plays; whatever the M8's own
+   speaker adds to the room comes out the other side as "room" sound and counts against
+   the mood.
 
 ## 1. System Settings
 

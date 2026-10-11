@@ -1,6 +1,9 @@
 """The `roomtone` command.
 
     roomtone devices                 audio devices and MIDI ports
+    roomtone aggregate create        build the "roomtone" aggregate device (M8 in,
+                                     mic in, output; docs/BENCH.md step 3)
+    roomtone aggregate show|destroy  inspect it, or remove it again
     roomtone bench latency           click round trip through the speakers
     roomtone bench marker            listen for the marker under a pad, then alone
     roomtone bench midi              notes, a CC sweep and clock to the M8
@@ -88,6 +91,82 @@ def cmd_devices(args: argparse.Namespace) -> int:
             print(f"  {kind}: " + ", ".join(names))
     except ImportError:
         print("  " + MIDI_HINT.replace("\n", "\n  "))
+    return 0
+
+
+# aggregate -------------------------------------------------------------------
+
+def _coreaudio() -> ModuleType | None:
+    try:
+        from roomtone import coreaudio
+        coreaudio.devices()  # the first HAL call; fails off macOS
+        return coreaudio
+    except (ImportError, OSError) as exc:
+        print(f"CoreAudio is not reachable ({exc}); build the aggregate in Audio MIDI Setup "
+              "instead (docs/BENCH.md step 3).")
+        return None
+
+
+def _show_aggregate(ca: ModuleType, agg: Any) -> None:
+    members, clock = ca.aggregate_members(agg)
+    by_uid = {d.uid: d for d in ca.devices()}
+    print(f"{agg.name!r}: {agg.inputs} in, {agg.outputs} out, {agg.sample_rate:.0f} Hz")
+    ch_in = ch_out = 0
+    for uid in members:
+        d = by_uid.get(uid)
+        if d is None:
+            print(f"  {uid}: not present")
+            continue
+        spans = []
+        if d.inputs:
+            spans.append(f"input channels {ch_in}..{ch_in + d.inputs - 1}")
+            ch_in += d.inputs
+        if d.outputs:
+            spans.append(f"output channels {ch_out}..{ch_out + d.outputs - 1}")
+            ch_out += d.outputs
+        tag = "  (clock source)" if uid == clock else ""
+        print(f"  {d.name!r}: " + ", ".join(spans) + tag)
+
+
+def cmd_aggregate(args: argparse.Namespace) -> int:
+    ca = _coreaudio()
+    if ca is None:
+        return 2
+    cfg = _config(args)
+    name = cfg.aggregate_device or "roomtone"
+    existing = [d for d in ca.devices() if d.is_aggregate and d.name == name]
+    if args.action == "show":
+        if not existing:
+            print(f"No aggregate device named {name!r}. Create it with: roomtone aggregate create")
+            return 1
+        _show_aggregate(ca, existing[0])
+        return 0
+    if args.action == "destroy":
+        if not existing:
+            print(f"No aggregate device named {name!r}; nothing to do.")
+            return 0
+        ca.destroy_aggregate(existing[0])
+        print(f"Removed aggregate device {name!r}.")
+        return 0
+    if existing:
+        print(f"Aggregate device {name!r} already exists:")
+        _show_aggregate(ca, existing[0])
+        print("Remove it first with: roomtone aggregate destroy")
+        return 1
+    try:
+        m8 = ca.find(args.m8 or cfg.m8_input_device, inputs=True)
+        mic = ca.find(args.mic or cfg.mic_input_device, inputs=True)
+        out = ca.find(args.output or cfg.output_device, outputs=True)
+        # M8 first, mic second: AudioIO expects the M8 on input channels 0 and 1, the
+        # mic on channel 2. The output is the clock, so the reference is what we wrote.
+        agg = ca.create_aggregate(name, [(m8, True), (mic, True), (out, False)], clock=out,
+                                  sample_rate=cfg.sample_rate)
+    except (LookupError, ValueError, OSError) as exc:
+        print(f"Could not build the aggregate: {exc}")
+        return 1
+    print(f"Created aggregate device at {agg.sample_rate:.0f} Hz, drift correction on "
+          f"{m8.name!r} and {mic.name!r}.")
+    _show_aggregate(ca, agg)
     return 0
 
 
@@ -217,6 +296,11 @@ def cmd_baseline(args: argparse.Namespace) -> int:
         return 1
     finally:
         io.stop()
+    if rir is None:
+        print("The marker was never found in the mic, so there is no room response to save.\n"
+              "Check that the speakers are up and the mic hears them (roomtone bench latency), "
+              "then try a louder marker (--level) or a longer one (--length).")
+        return 1
     lock.save_baseline(args.out, rir)
     print(f"Saved the room response to {args.out}.")
     return 0
@@ -265,7 +349,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     io = audio_mod.AudioIO(cfg, source, backend=backend)
     locker = lock.Locker(cfg)
     if args.baseline:
-        locker.rir = lock.load_baseline(args.baseline)
+        try:
+            locker.rir = lock.load_baseline(args.baseline)
+        except ValueError as exc:
+            print(f"Cannot use {args.baseline}: {exc}")
+            return 2
     publishers: list[Any] = [TuiPublisher(cfg.tui_host, cfg.tui_port)]
     if not args.no_tidal:
         publishers.append(TidalPublisher(cfg.tidal_host, cfg.tidal_port))
@@ -325,6 +413,13 @@ def build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="command", required=True)
 
     sub.add_parser("devices", help="list audio devices and MIDI ports").set_defaults(func=cmd_devices)
+
+    b = sub.add_parser("aggregate", help="build, show or remove the aggregate audio device")
+    b.add_argument("action", choices=["create", "show", "destroy"])
+    b.add_argument("--m8", help="M8 input device name (default from config)")
+    b.add_argument("--mic", help="mic input device name (default from config)")
+    b.add_argument("--output", help="output device name, the clock source (default from config)")
+    b.set_defaults(func=cmd_aggregate)
 
     bench = sub.add_parser("bench", help="day-one bench checks")
     bsub = bench.add_subparsers(dest="bench", required=True)

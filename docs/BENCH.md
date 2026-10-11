@@ -18,6 +18,8 @@ later steps and later sessions depend on those numbers.
 - Software installed per the [README](../README.md): `pip install -e '.[audio,dev]'`,
   SuperCollider with SuperDirt, Tidal 1.9 and an editor.
 - The kitchen quiet for steps 5 and 7: nobody cooking or talking, no dishwasher.
+- The M8's own speaker off (m8/SETUP.md, "What you need before starting"). Only the Mac's
+  output is subtracted from the mic; an M8 playing into the room looks like a busy room.
 
 ## 1. The M8 shows up
 
@@ -29,6 +31,9 @@ later steps and later sessions depend on those numbers.
    ```
 
    It lists the audio devices (with channel counts and sample rates) and the MIDI ports.
+   The first command that opens an input device makes macOS ask whether the app that
+   launched it (Terminal, or the Claude app) may use the microphone; until that is
+   allowed every recording command hangs silently. Allow it once.
 3. Open Audio MIDI Setup (Applications > Utilities), Window > Show Audio Devices, and
    select the M8. Read its Format field.
 4. On the M8, open System Settings and read the firmware version.
@@ -68,7 +73,22 @@ On recent MacBooks the headphone jack can show up as its own output device only 
 something is plugged in, and the aggregate has to contain the device that actually feeds
 the Five. The Five's settings come in step 4; it can sit silent until then.
 
-### 3b. Build "roomtone" in Audio MIDI Setup
+### 3b. Build "roomtone"
+
+The quick way is one command. It finds the three members by the names in
+`roomtone/config.py` (`m8_input_device`, `mic_input_device`, `output_device`; override with
+`--m8`, `--mic`, `--output`), switches them to the project sample rate, and builds the
+aggregate with the M8 first, the mic second and the output as clock source, drift
+correction on the other two:
+
+```
+roomtone aggregate create
+roomtone aggregate show
+```
+
+`show` prints the channel map; `destroy` removes the device again. The aggregate is the
+same kind Audio MIDI Setup makes, so it appears there and survives a reboot. Skip to
+step 9 below if the command worked; the rest of this section is the same thing by hand.
 
 1. Open Audio MIDI Setup, Window > Show Audio Devices.
 2. Set the M8, the mic (if it is joining) and the built-in output to the same sample rate in
