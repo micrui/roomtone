@@ -70,13 +70,30 @@ macOS, Python 3.11 or newer.
 
    `audio` adds sounddevice and python-rtmidi; `dev` adds pytest. The optional `yamnet`
    extra adds the local audio event model used for speech and dish detection.
-2. SuperCollider from [supercollider.github.io](https://supercollider.github.io), then the
-   SuperDirt quark: in SuperCollider evaluate `Quarks.install("SuperDirt");` and recompile
-   the class library.
-3. TidalCycles 1.9 and an editor (Pulsar with the TidalCycles package, or VS Code with the
-   TidalCycles extension), following the install guide at
-   [tidalcycles.org](https://tidalcycles.org). The default BootTidal.hs is enough;
-   `tidal/roomtone.tidal` needs nothing extra from it.
+2. SuperCollider and the SuperDirt quark. With Homebrew:
+
+   ```
+   brew install --cask supercollider
+   /Applications/SuperCollider.app/Contents/MacOS/sclang sc/install-superdirt.scd
+   ```
+
+   (or install SuperCollider from [supercollider.github.io](https://supercollider.github.io)
+   and evaluate `Quarks.install("SuperDirt");` in the IDE, then recompile).
+3. TidalCycles. Tidal is a Haskell library, so it needs GHC; ghcup is the easy way, and
+   GHC 9.8 is the newest release Tidal 1.10 is tested with:
+
+   ```
+   brew install ghcup
+   ghcup install ghc 9.8.4 --set
+   ghcup install cabal 3.16.1.0 --set
+   cabal update
+   cabal install tidal --lib
+   ```
+
+   Put `~/.ghcup/bin` on your PATH. An editor is optional: Pulsar with the TidalCycles
+   package or VS Code with the TidalCycles extension gives you live coding, and
+   `roomtone tidal` runs the file from a terminal with no editor (below). The default
+   BootTidal.hs is enough; `tidal/roomtone.tidal` needs nothing extra from it.
 4. The M8 configured per [m8/SETUP.md](m8/SETUP.md), and the bench checks in
    [docs/BENCH.md](docs/BENCH.md) done once (they build the aggregate device with
    `roomtone aggregate create` and record the empty-house baseline).
@@ -94,8 +111,15 @@ macOS, Python 3.11 or newer.
 
    (or open the file in the SuperCollider IDE and evaluate it). Wait for the line
    `roomtone: SuperDirt is up`.
-3. Open `tidal/roomtone.tidal` in your Tidal editor, start Tidal, and evaluate the blocks top
-   to bottom: `setcps`, the `let` block, d1 to d8 (the layers), d9 (tempo), d10 (mood CCs).
+3. Start Tidal. Either open `tidal/roomtone.tidal` in your Tidal editor and evaluate the
+   blocks top to bottom (`setcps`, the `let` block, d1 to d8, d9, d10), or run
+
+   ```
+   roomtone tidal
+   ```
+
+   which evaluates the same blocks in a headless ghci and stays up; anything you type
+   there (ended by a blank line) goes to Tidal, so `hush` and `d3 $ silence` work.
    With nothing else running you hear the drone alone.
 4. Start the listener and controller with the terminal UI:
 
@@ -105,7 +129,10 @@ macOS, Python 3.11 or newer.
 
    It locks onto the room over the first blocks and starts publishing control values.
    `roomtone run --sim` does the same with simulated room readings, for working on the
-   music without the mic.
+   control path without the mic. To hear what each state of the room sounds like without
+   waiting for the room, `roomtone run --audition empty:60,cooking:120,dinner:90,party:120`
+   keeps the real audio running and feeds the Controller that mood script instead of the
+   mic (the Controller's slew still applies, so layers arrive over a minute or two).
 
 To stop: Ctrl-C in the roomtone terminal, `hush` in Tidal. You can keep live-coding in the
 Tidal file the whole time; the room only changes control values, never the patterns, so your

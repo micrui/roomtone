@@ -53,6 +53,8 @@ LOCKED (the residual may still contain our own music).
 
 from __future__ import annotations
 
+from typing import Sequence
+
 import logging
 from collections import deque
 from dataclasses import dataclass
@@ -204,3 +206,51 @@ class MoodTracker:
             log.info("mood: %s -> %s", self._name.value, candidate.value)
             self._name = candidate
             self._pending, self._pending_count = None, 0
+
+
+# Audition ----------------------------------------------------------------------
+
+# One representative mood per kitchen script mode (roomtone.kitchen.MODES), chosen so
+# the Controller's layer rules light up what that state is meant to sound like:
+# cooking brings in pad, figure, phrases and shimmer; dinner is talk (figure drops,
+# everything ducks); party reaches the bass and the pulse.
+AUDITION_MOODS: dict[str, Mood] = {
+    "empty": Mood(0.05, 0.05, 0.05, MoodName.EMPTY, 1.0),
+    "cooking": Mood(0.5, 0.2, 0.45, MoodName.COOKING, 1.0),
+    "dinner": Mood(0.45, 0.8, 0.2, MoodName.CONVERSATION, 1.0),
+    "party": Mood(0.9, 0.7, 0.85, MoodName.LOUD_BUSY, 1.0),
+}
+
+
+class ScriptedMood:
+    """A mood tracker that reads a script instead of the room.
+
+    `phases` are (seconds, mode) as roomtone.kitchen.parse_script gives them, and
+    the script repeats. Each `update` call is one analysis block of `block_seconds`,
+    so the mood follows the script by block count. The Controller's slew still
+    applies downstream, so layers arrive as they would in the kitchen.
+    """
+
+    def __init__(self, phases: Sequence[tuple[float, str]], block_seconds: float):
+        if not phases:
+            raise ValueError("the audition script needs at least one phase")
+        for _, mode in phases:
+            if mode not in AUDITION_MOODS:
+                raise ValueError(f"unknown mode {mode!r}; modes: {', '.join(AUDITION_MOODS)}")
+        self.phases = list(phases)
+        self.block_seconds = float(block_seconds)
+        self.total = sum(seconds for seconds, _ in self.phases)
+        self.blocks = 0
+
+    def mode_at(self, t_seconds: float) -> str:
+        t = t_seconds % self.total if self.total > 0 else 0.0
+        for seconds, mode in self.phases:
+            if t < seconds:
+                return mode
+            t -= seconds
+        return self.phases[-1][1]
+
+    def update(self, features: Features, lock: LockState) -> Mood:
+        mood = AUDITION_MOODS[self.mode_at(self.blocks * self.block_seconds)]
+        self.blocks += 1
+        return mood

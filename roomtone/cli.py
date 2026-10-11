@@ -9,7 +9,11 @@
     roomtone bench midi              notes, a CC sweep and clock to the M8
     roomtone baseline                record the empty-house room response
     roomtone run [--sim]             the whole loop (--sim needs no hardware;
-                                     --script sets what the simulated kitchen does)
+                                     --script sets what the simulated kitchen does;
+                                     --audition plays a scripted mood through the
+                                     real speakers to hear each arrangement)
+    roomtone tidal [FILE]            run the Tidal file headlessly (needs ghci, tidal,
+                                     and SuperDirt from `sclang sc/startup.scd`)
 
 The bench commands follow the day-one checks in docs/SPEC.md section 11.
 Anything that needs hardware or an optional package says so and exits,
@@ -270,6 +274,29 @@ def cmd_bench_midi(args: argparse.Namespace) -> int:
     return 0
 
 
+# tidal -----------------------------------------------------------------------
+
+def cmd_tidal(args: argparse.Namespace) -> int:
+    from roomtone import tidal
+    import shutil
+    from pathlib import Path
+    if shutil.which(args.ghci) is None:
+        print(f"{args.ghci!r} not found. Install GHC (ghcup is the easy way) and then the "
+              "Tidal library:  cabal install tidal --lib")
+        return 2
+    boot = Path(args.boot) if args.boot else tidal.find_boot_file()
+    if boot is None or not boot.exists():
+        print("BootTidal.hs not found; pass --boot, or set TIDAL_BOOT, or install Tidal with "
+              "cabal install tidal --lib")
+        return 2
+    path = Path(args.file)
+    if not path.exists():
+        print(f"{path} does not exist")
+        return 2
+    print(f"roomtone tidal: {path} via {boot}")
+    return tidal.run(path, boot, keep=not args.once, settle=args.settle, ghci=args.ghci)
+
+
 # baseline --------------------------------------------------------------------
 
 def cmd_baseline(args: argparse.Namespace) -> int:
@@ -358,15 +385,21 @@ def cmd_run(args: argparse.Namespace) -> int:
     if not args.no_tidal:
         publishers.append(TidalPublisher(cfg.tidal_host, cfg.tidal_port))
     tui = _module("roomtone.tui", "the terminal display") if args.tui else None
+    audition = mods["mood"].ScriptedMood(args.audition, cfg.block_seconds) if args.audition else None
+    phase_at = (audition.mode_at if audition is not None else
+                script.phase_at if script is not None else None)
     if tui is None:
-        publishers.append(_PrintPublisher(script.phase_at if script is not None else None))
+        publishers.append(_PrintPublisher(phase_at))
     log = BlockLog(cfg.log_dir)
-    engine = Engine(cfg, io, locker, mods["mood"].MoodTracker(cfg), Controller(cfg), publishers,
+    tracker = audition if audition is not None else mods["mood"].MoodTracker(cfg)
+    engine = Engine(cfg, io, locker, tracker, Controller(cfg), publishers,
                     log=log, marker=source, extract=mods["features"].extract)
 
     where = (f"audio device {cfg.aggregate_device!r}" if not args.sim else
              "the simulated kitchen" + (f" (script {kitchen.format_script(script.phases)})"
                                         if script is not None else ""))
+    if audition is not None:
+        where += f", mood scripted ({kitchen.format_script(audition.phases)})"
     print(f"roomtone: {where}, {cfg.block_seconds:g} s blocks, "
           f"Tidal {'off' if args.no_tidal else f'{cfg.tidal_host}:{cfg.tidal_port}'}, "
           f"TUI feed {cfg.tui_host}:{cfg.tui_port}, log {log.path}")
@@ -455,11 +488,23 @@ def build_parser() -> argparse.ArgumentParser:
                    help="with --sim: what the kitchen does, phase by phase, repeating; modes "
                         f"{', '.join(kitchen.MODES)} (default "
                         f"{kitchen.format_script(kitchen.DEFAULT_SCRIPT)})")
+    b.add_argument("--audition", type=_script_arg, metavar="MODE:SECONDS,...",
+                   help="ignore the room and feed the Controller this repeating mood script "
+                        f"(modes {', '.join(kitchen.MODES)}); audio still runs, so you hear "
+                        "each arrangement through the speakers")
     b.add_argument("--blocks", type=int, help="stop after this many blocks")
     b.add_argument("--block-seconds", type=float, help="analysis block length (default from config)")
     b.add_argument("--log-dir", help="where session logs go (default from config)")
     b.add_argument("--dry-run", action="store_true", help="wire everything, then exit without starting")
     b.set_defaults(func=cmd_run)
+
+    b = sub.add_parser("tidal", help="evaluate the Tidal file in a headless ghci and keep it running")
+    b.add_argument("file", nargs="?", default="tidal/roomtone.tidal", help="the .tidal file (default tidal/roomtone.tidal)")
+    b.add_argument("--boot", help="BootTidal.hs to use (default: the installed tidal package's)")
+    b.add_argument("--ghci", default="ghci", help="ghci executable (default ghci)")
+    b.add_argument("--once", action="store_true", help="evaluate the file and quit instead of staying up")
+    b.add_argument("--settle", type=float, default=1.0, help="seconds between blocks (default 1)")
+    b.set_defaults(func=cmd_tidal)
     return p
 
 

@@ -153,3 +153,23 @@ def test_agreement_lowers_confidence_after_a_change():
         mood = tracker.update(TALK, LOCKED)
     assert mood.name is MoodName.CONVERSATION
     assert mood.confidence == pytest.approx(cfg.hysteresis_blocks / 10)
+
+
+def test_scripted_mood_follows_the_script_by_block_and_repeats():
+    from roomtone.mood import AUDITION_MOODS, ScriptedMood
+    from roomtone.types import Features, LockState, MoodName
+    import pytest
+    s = ScriptedMood([(20.0, "empty"), (10.0, "party")], block_seconds=10.0)
+    names = [s.update(Features(), LockState()).name for _ in range(7)]
+    assert names == [MoodName.EMPTY, MoodName.EMPTY, MoodName.LOUD_BUSY] * 2 + [MoodName.EMPTY]
+    assert s.mode_at(25.0) == "party" and s.mode_at(31.0) == "empty"
+    assert AUDITION_MOODS["cooking"].energy > AUDITION_MOODS["empty"].energy
+    with pytest.raises(ValueError, match="unknown mode"):
+        ScriptedMood([(5.0, "rave")], 10.0)
+
+
+def test_run_audition_dry_run_names_the_script(monkeypatch, tmp_path, capsys):
+    from roomtone import cli
+    assert cli.main(["run", "--sim", "--audition", "empty:30,party:60", "--dry-run",
+                     "--log-dir", str(tmp_path)]) == 0
+    assert "mood scripted (empty:30,party:60)" in capsys.readouterr().out
