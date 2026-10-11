@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m pytest*)",
+      "Bash(python -m pytest*)",
+      "Bash(pytest*)",
+      "Bash(python3 -m roomtone.cli*)",
+      "Bash(python -m roomtone.cli*)",
+      "Bash(python3 -m roomtone.tui*)",
+      "Bash(python -m roomtone.tui*)",
+      "Bash(roomtone *)",
+      "Bash(pip install -e*)",
+      "Bash(git status*)",
+      "Bash(git diff*)",
+      "Bash(git log*)"
+    ]
+  }
+}
