@@ -13,6 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 audio = ["sounddevice>=0.4.6", "python-rtmidi>=1.5"]
+m8 = ["pyserial>=3.5"]
 yamnet = ["tflite-runtime; platform_machine != 'arm64'", "tensorflow; platform_machine == 'arm64'"]
 dev = ["pytest>=8"]
 

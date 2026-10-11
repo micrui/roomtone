@@ -36,7 +36,17 @@ later steps and later sessions depend on those numbers.
    allowed every recording command hangs silently. Allow it once.
 3. Open Audio MIDI Setup (Applications > Utilities), Window > Show Audio Devices, and
    select the M8. Read its Format field.
-4. On the M8, open System Settings and read the firmware version.
+4. Read the firmware version and the settings without touching the M8:
+
+   ```
+   roomtone m8 info
+   ```
+
+   It walks the M8's Project view over USB serial (navigation keys only, EDIT only on
+   the entries that open pages) and prints the firmware, the system and MIDI settings,
+   the Track MIDI Input table and how many MIDI mappings the song holds. Needs
+   `pip install 'roomtone[m8]'`. If it cannot reach the port, open System Settings on
+   the M8 and read the version there.
 
 Write down: the M8's audio device name, sample rate, bit depth, input channel count, MIDI
 port name, firmware version.

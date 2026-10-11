@@ -15,6 +15,8 @@
     roomtone tidal [FILE]            run the Tidal file headlessly (needs ghci, tidal,
                                      and SuperDirt from `sclang sc/startup.scd`)
     roomtone panic                   note-off for every key on every channel of the M8
+    roomtone m8 info|screen          read the M8's firmware, settings and MIDI setup over
+                                     its USB serial display protocol (navigation keys only)
 
 The bench commands follow the day-one checks in docs/SPEC.md section 11.
 Anything that needs hardware or an optional package says so and exits,
@@ -300,6 +302,62 @@ def cmd_panic(args: argparse.Namespace) -> int:
     return 0 if send_panic(_config(args).midi_out_port) else 2
 
 
+# m8 --------------------------------------------------------------------------
+
+M8_HINT = ("pyserial is not installed, so roomtone cannot talk to the M8's serial port.\n"
+           "Install it with:  pip install 'roomtone[m8]'")
+
+
+def _m8_link(args: argparse.Namespace) -> Any | None:
+    from roomtone import m8
+    try:
+        return m8.M8Link(args.port)
+    except ImportError:
+        print(M8_HINT)
+    except LookupError as exc:
+        print(exc)
+    except OSError as exc:
+        print(f"Could not open the M8's serial port: {exc}")
+    return None
+
+
+def cmd_m8(args: argparse.Namespace) -> int:
+    from roomtone import m8
+    link = _m8_link(args)
+    if link is None:
+        return 2
+    try:
+        if args.what == "screen":
+            link.enable()
+            print(link.read(args.seconds).text())
+            return 0
+        info = m8.read_info(link)
+    finally:
+        link.close()
+    print(f"M8 {info.get('model', '?')}, firmware {info.get('firmware', '?')}, "
+          f"project {info.get('project', '?')!r}, tempo {info.get('tempo', '?')}, "
+          f"transpose {info.get('transpose', '?')}")
+    if "error" in info:
+        print(info["error"])
+        return 1
+    for key, title in (("system", "System settings"), ("midi", "MIDI settings")):
+        page = info.get(key)
+        print(f"{title}:")
+        if not page:
+            print("  (page not reached)")
+            continue
+        for label, value in page.items():
+            print(f"  {label:<14} {value}")
+    table = info.get("track_midi_input") or {}
+    if table:
+        print("Track MIDI input:")
+        for key, values in table.items():
+            print(f"  {key:<6} " + " ".join(values))
+    print(f"MIDI mappings: {info.get('mappings', '?')}")
+    print("The M8 is left in its Project view.")
+    return 0
+
+
 # tidal -----------------------------------------------------------------------
 
 def cmd_tidal(args: argparse.Namespace) -> int:
@@ -530,6 +588,13 @@ def build_parser() -> argparse.ArgumentParser:
     b.set_defaults(func=cmd_run)
 
     sub.add_parser("panic", help="note-off for every key on every channel of the M8").set_defaults(func=cmd_panic)
+
+    b = sub.add_parser("m8", help="read the M8's firmware and settings over USB serial")
+    b.add_argument("what", choices=["info", "screen"], help="info: firmware, system and MIDI settings, "
+                   "mapping count; screen: the current screen as text")
+    b.add_argument("--port", help="serial port (default: found by USB product name)")
+    b.add_argument("--seconds", type=float, default=2.0, help="for screen: how long to read (default 2)")
+    b.set_defaults(func=cmd_m8)
 
     b = sub.add_parser("tidal", help="evaluate the Tidal file in a headless ghci and keep it running")
     b.add_argument("file", nargs="?", default="tidal/roomtone.tidal", help="the .tidal file (default tidal/roomtone.tidal)")

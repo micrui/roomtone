@@ -69,7 +69,9 @@ macOS, Python 3.11 or newer.
    ```
 
    `audio` adds sounddevice and python-rtmidi; `dev` adds pytest. The optional `yamnet`
-   extra adds the local audio event model used for speech and dish detection.
+   extra adds the local audio event model used for speech and dish detection, and `m8`
+   adds pyserial for `roomtone m8 info`, which reads the M8's firmware and settings over
+   the USB cable by driving its own menus (the display protocol the m8c client uses).
 2. SuperCollider and the SuperDirt quark. With Homebrew:
 
    ```
