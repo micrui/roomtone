@@ -85,3 +85,26 @@ def test_cli_tidal_panics_on_exit(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr(cli, "send_panic", lambda port: calls.append(port) or True)
     f = tmp_path / "a.tidal"; f.write_text("d1 $ silence\n")
     assert cli.main(["tidal", str(f)]) == 0 and calls == ["M8"]
+
+
+def test_run_hushes_and_closes_on_sigterm(monkeypatch, tmp_path):
+    import os, signal, threading
+    sent = []
+
+    class FakeSession:
+        def __init__(self, boot, on_line, ghci="ghci"): pass
+        def send(self, code): sent.append(code)
+        def alive(self): return True
+        def close(self, timeout=10.0): sent.append("<closed>")
+
+    monkeypatch.setattr(tidal, "TidalSession", FakeSession)
+    path = tmp_path / "x.tidal"; path.write_text("d1 $ silence\n")
+
+    def lines():
+        yield "d2 $ silence\n"
+        os.kill(os.getpid(), signal.SIGTERM)
+        yield "\n"
+        yield "never\n"
+
+    rc = tidal.run(path, tmp_path / "Boot.hs", stdin=lines(), on_line=lambda l: None, settle=0.0, boot_settle=0.0)
+    assert rc == 0 and sent == ["d1 $ silence", "<closed>"]   # close() is what sends hush

@@ -15,6 +15,7 @@ from __future__ import annotations
 import glob
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import threading
@@ -119,6 +120,11 @@ def run(path: Path, boot: Path, keep: bool = True, stdin: Iterable[str] | None =
     """Evaluate every block of `path`, then forward `stdin` lines (blocks end at a blank
     line) until it ends or Ctrl-C. Returns 0, or 1 if ghci died."""
     session = TidalSession(boot, on_line, ghci=ghci)
+
+    def _terminate(signum, frame):            # a plain kill should still hush and release notes
+        raise KeyboardInterrupt
+    if threading.current_thread() is threading.main_thread():
+        signal.signal(signal.SIGTERM, _terminate)
     try:
         time.sleep(boot_settle)
         for i, block in enumerate(blocks(path.read_text())):
