@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 import mido
 
@@ -107,3 +107,24 @@ def cc_sweep(port: Any, channel: int, cc: int, lo: int, hi: int, seconds: float,
     interval = seconds / max(1, len(values) - 1)
     _paced(len(values), interval, lambda i: send_cc(port, channel, cc, values[i]), clock, sleep)
     return values
+
+
+def panic(port: Any, channels: Iterable[int] = range(1, 17)) -> int:
+    """Silence every note: all-notes-off and all-sound-off, then an explicit note-off for
+    every key, on each channel. Returns the number of messages sent.
+
+    Why the explicit note-offs: a note-off that never arrives (a crashed sender, a MIDI
+    port that vanished mid-note) leaves the M8 holding the key, and it then ignores a
+    new note-on for that key on that track, so the track falls silent until something
+    releases it. The M8 was seen in that state on the bench.
+    """
+    n = 0
+    for channel in channels:
+        ch = _channel(channel)
+        port.send(mido.Message("control_change", channel=ch, control=123, value=0))
+        port.send(mido.Message("control_change", channel=ch, control=120, value=0))
+        n += 2
+        for note in range(128):
+            port.send(mido.Message("note_off", channel=ch, note=note, velocity=0))
+            n += 1
+    return n

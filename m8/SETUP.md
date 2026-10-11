@@ -79,6 +79,14 @@ Instrument View. Types follow docs/SPEC.md section 8.1. The sound hints are star
 not requirements. Every instrument here has a filter; the cutoff of instruments 00, 01, 02
 and 04 is driven by CC in section 5, so set the others by ear.
 
+Envelopes matter more than the sound. Tidal holds the drone, pad and bass notes for most of
+their loops (17.8, 21.3 and 37.9 s) and sends the note-off at the end, so those three need
+an **ADSR ENV** on the amplitude with sustain up: the note then holds until the note-off.
+An AHD envelope decays while the note is still held, and the first audition on the bench
+showed every drone note gone within 10 s of its 17.8 s loop, leaving the room silent
+between notes. Figure, shimmer, pulse and phrases are short by nature and an AHD or DRUM
+envelope suits them.
+
 1. **00 drone: Macrosynth** (the Braids port, over 40 models). Pick a model that moves
    slowly on a held note; SAW SWARM, WAVE MAP or HARMONICS are good first tries (the M8
    may abbreviate model names). Low-pass filter, cutoff fairly low, generous reverb send.

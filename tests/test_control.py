@@ -54,7 +54,7 @@ def test_voices_drop_figure_and_darken():
 
 @pytest.mark.parametrize("mood, scale", [
     (MoodName.EMPTY, "open"), (MoodName.COOKING, "pentatonic"),
-    (MoodName.CONVERSATION, "minor"), (MoodName.LOUD_BUSY, "lydian")])
+    (MoodName.CONVERSATION, "dorian"), (MoodName.LOUD_BUSY, "lydian")])
 def test_scale_by_mood(mood, scale):
     assert Controller().update(Mood(name=mood)).scale == scale
 
@@ -77,7 +77,15 @@ def test_transpose_drifts_every_40_blocks():
     seen = [c.update(Mood()).transpose for _ in range(200)]
     changes = [i for i in range(1, 200) if seen[i] != seen[i - 1]]
     assert changes == [40, 80, 120, 160]
-    assert all(-3 <= v <= 3 for v in seen) and seen[0] == 0
+    assert all(-5 <= v <= 5 for v in seen) and seen[0] == 0
+    assert all(abs(seen[i] - seen[i - 1]) in (2, 5) for i in changes)   # by fifths, never a semitone
+
+
+def test_transpose_drift_covers_both_directions_and_stays_bounded():
+    from roomtone.control import TRANSPOSE_LIMIT
+    c = Controller(rng=random.Random(1), transpose_every=1)
+    seen = [c.update(Mood()).transpose for _ in range(400)]
+    assert min(seen) < 0 < max(seen) and all(abs(v) <= TRANSPOSE_LIMIT for v in seen)
 
 
 class CaptureClient:

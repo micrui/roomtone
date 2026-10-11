@@ -60,3 +60,28 @@ def test_cli_tidal_explains_missing_boot_file(monkeypatch, tmp_path, capsys):
     f = tmp_path / "a.tidal"; f.write_text("d1 $ silence\n")
     assert cli.main(["tidal", str(f)]) == 2
     assert "BootTidal.hs not found" in capsys.readouterr().out
+
+
+def test_cli_panic_sends_to_the_configured_port(monkeypatch, capsys):
+    from roomtone import midi
+
+    class Port:
+        sent, closed = [], False
+        def send(self, m): Port.sent.append(m)
+        def close(self): Port.closed = True
+
+    monkeypatch.setattr(midi, "open_out", lambda name: Port())
+    assert cli.main(["panic"]) == 0
+    assert len(Port.sent) == 16 * 130 and Port.closed
+    assert "all-notes-off" in capsys.readouterr().out
+
+
+def test_cli_tidal_panics_on_exit(monkeypatch, tmp_path, capsys):
+    calls = []
+    monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/ghci")
+    monkeypatch.setattr(tidal, "find_boot_file", lambda: tmp_path / "Boot.hs")
+    (tmp_path / "Boot.hs").write_text("")
+    monkeypatch.setattr(tidal, "run", lambda *a, **k: 0)
+    monkeypatch.setattr(cli, "send_panic", lambda port: calls.append(port) or True)
+    f = tmp_path / "a.tidal"; f.write_text("d1 $ silence\n")
+    assert cli.main(["tidal", str(f)]) == 0 and calls == ["M8"]

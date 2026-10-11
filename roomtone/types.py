@@ -83,7 +83,7 @@ class Controls:
     bright: float = 0.3
     layers: int = 0b00000001     # bitmask over config.LAYER_ORDER, bit 0 = drone
     tempo_bpm: float = 60.0
-    scale: str = "open"          # open | pentatonic | minor | lydian
+    scale: str = "open"          # open | pentatonic | dorian | lydian (any Tidal scale name passes through)
     transpose: int = 0           # semitones, slow key drift
 
     def as_dict(self) -> dict[str, Any]:

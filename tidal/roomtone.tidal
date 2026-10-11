@@ -21,7 +21,7 @@
 --   energy, voices, rhythm, bright   0..1
 --   layers                           bitmask as a float, bit 0 = drone
 --   tempo_bpm                        beats per minute (default 60)
---   scale                            string: open | pentatonic | minor | lydian
+--   scale                            string: open | pentatonic | dorian | lydian
 --   transpose                        semitones, sent as a float
 --   layer_drone .. layer_spare       0 or 1, one per layer
 --
@@ -91,6 +91,7 @@ let energy   = cF 0   "energy"    :: Pattern Double
     scaleFor :: String -> String
     scaleFor "open"       = "ritusen"
     scaleFor "pentatonic" = "majPent"
+    scaleFor "dorian"     = "dorian"     -- conversation: minor in colour, shares C D F G A with "open"
     scaleFor "minor"      = "minor"
     scaleFor "lydian"     = "lydian"
     scaleFor other        = other

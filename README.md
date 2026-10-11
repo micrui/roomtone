@@ -167,12 +167,18 @@ file at any moment and play along with the room, and neither of you overwrites t
 
 ## Known limits of this build
 
-- Everything above was verified in simulation only. No M8, mic, or Sonos has touched
-  this code yet; docs/BENCH.md is the first thing to run on real hardware.
+- The hardware this has met is a MacBook Air with the M8 over USB, its own mic and
+  speakers standing in for the measurement mic and the Sonos ([docs/bench/](docs/bench/)).
+  On that rig the lock holds at 23 dB of echo suppression and the Tidal score plays the
+  M8 through SuperDirt. No Sonos or measurement mic has been tried.
 - The lock decides a block is "quiet" partly by comparing leftover energy in the marker
   band with the echo it predicts. If the music is far quieter than the mic noise floor,
   the marker is too, every block reads as loud, and the room response never adapts.
   Raise the marker level or the music level if the TUI never shows a quiet block.
-- Tidal patterns and the SuperCollider startup were written carefully but never
-  evaluated here. Expect to fix a name or two on first evaluation.
+- What the M8 makes of the score depends on its instruments: drone, pad and bass need a
+  sustaining (ADSR) amplitude envelope or they fade out under their held notes, and the
+  main level needs setting so the loudest case does not clip (m8/SETUP.md).
+- A note-off that never reaches the M8 leaves that track deaf to the same key until it
+  is released: `roomtone panic` sends a note-off for every key, and `roomtone tidal`
+  does so when it quits.
 - YAMNet labels are wired but need the model file and the `roomtone[yamnet]` extra.

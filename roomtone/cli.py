@@ -14,6 +14,7 @@
                                      real speakers to hear each arrangement)
     roomtone tidal [FILE]            run the Tidal file headlessly (needs ghci, tidal,
                                      and SuperDirt from `sclang sc/startup.scd`)
+    roomtone panic                   note-off for every key on every channel of the M8
 
 The bench commands follow the day-one checks in docs/SPEC.md section 11.
 Anything that needs hardware or an optional package says so and exits,
@@ -274,6 +275,31 @@ def cmd_bench_midi(args: argparse.Namespace) -> int:
     return 0
 
 
+# panic -----------------------------------------------------------------------
+
+def send_panic(port_name: str | None) -> bool:
+    """All notes off on the M8; False (with a message) when the port is not reachable."""
+    from roomtone import midi
+    try:
+        port = midi.open_out(port_name)
+    except ImportError:
+        print(MIDI_HINT)
+        return False
+    except LookupError as exc:
+        print(exc)
+        return False
+    try:
+        n = midi.panic(port)
+    finally:
+        port.close()
+    print(f"Sent all-notes-off to {port_name!r} ({n} messages).")
+    return True
+
+
+def cmd_panic(args: argparse.Namespace) -> int:
+    return 0 if send_panic(_config(args).midi_out_port) else 2
+
+
 # tidal -----------------------------------------------------------------------
 
 def cmd_tidal(args: argparse.Namespace) -> int:
@@ -294,7 +320,12 @@ def cmd_tidal(args: argparse.Namespace) -> int:
         print(f"{path} does not exist")
         return 2
     print(f"roomtone tidal: {path} via {boot}")
-    return tidal.run(path, boot, keep=not args.once, settle=args.settle, ghci=args.ghci)
+    try:
+        return tidal.run(path, boot, keep=not args.once, settle=args.settle, ghci=args.ghci)
+    finally:
+        # hush stops new notes; notes already sounding only end if their note-offs still
+        # get through, so release everything the M8 might be holding
+        send_panic(_config(args).midi_out_port)
 
 
 # baseline --------------------------------------------------------------------
@@ -497,6 +528,8 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--log-dir", help="where session logs go (default from config)")
     b.add_argument("--dry-run", action="store_true", help="wire everything, then exit without starting")
     b.set_defaults(func=cmd_run)
+
+    sub.add_parser("panic", help="note-off for every key on every channel of the M8").set_defaults(func=cmd_panic)
 
     b = sub.add_parser("tidal", help="evaluate the Tidal file in a headless ghci and keep it running")
     b.add_argument("file", nargs="?", default="tidal/roomtone.tidal", help="the .tidal file (default tidal/roomtone.tidal)")

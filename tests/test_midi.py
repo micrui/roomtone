@@ -58,3 +58,18 @@ def test_open_out_matches_substring(monkeypatch):
     assert midi.open_out("m8") == "opened M8 MIDI 1"
     with pytest.raises(LookupError):
         midi.open_out("nope")
+
+
+def test_panic_releases_every_key_on_every_channel():
+    from roomtone import midi
+
+    class Port:
+        def __init__(self): self.sent = []
+        def send(self, m): self.sent.append(m)
+
+    port = Port()
+    n = midi.panic(port, channels=(1, 10))
+    assert n == len(port.sent) == 2 * (2 + 128)
+    offs = [m for m in port.sent if m.type == "note_off"]
+    assert {m.channel for m in offs} == {0, 9} and {m.note for m in offs} == set(range(128))
+    assert {m.control for m in port.sent if m.type == "control_change"} == {120, 123}

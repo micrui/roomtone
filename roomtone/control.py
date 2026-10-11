@@ -11,9 +11,17 @@ The mapping in plain words:
   (only while cooking), shimmer, pulse (also when the room has a beat), bass;
   the figure drops out while people are talking;
 - tempo follows rhythm, from 54 to 104 BPM;
-- the scale follows the named mood;
-- the key drifts: every 40 blocks (20 minutes at 30 s blocks) it moves to a
-  new transpose between -3 and +3 semitones.
+- the scale follows the named mood: open (ritusen) when empty, major pentatonic
+  when cooking, dorian when people talk, lydian when loud and busy. Dorian rather
+  than natural minor for talk: held pad and drone notes from the old scale ring
+  on for up to 20 s after a change, and dorian shares every note of the open
+  scale and all but one of the pentatonic, where natural minor clashes on two;
+- the key drifts: every 40 blocks (20 minutes at 30 s blocks) it moves a fifth
+  (5 semitones) or two fifths (2 semitones) up or down, staying within 5
+  semitones of the home key. Each Tidal layer picks the new key up at its own
+  next note, so for up to 40 s two keys sound at once; keys a fifth apart
+  share six of seven notes and two fifths apart five, where a semitone or a
+  minor third apart would clash.
 
 Every value moves by at most 0.1 per block, so nothing lurches. Layer changes
 happen only here, once per block; the Tidal side lands them on bar lines.
@@ -39,14 +47,15 @@ log = logging.getLogger(__name__)
 SCALES = {
     MoodName.EMPTY: "open",
     MoodName.COOKING: "pentatonic",
-    MoodName.CONVERSATION: "minor",
+    MoodName.CONVERSATION: "dorian",
     MoodName.LOUD_BUSY: "lydian",
 }
 
 TEMPO_MIN_BPM = 54.0
 TEMPO_SPAN_BPM = 50.0
 TRANSPOSE_EVERY_BLOCKS = 40
-TRANSPOSE_RANGE = range(-3, 4)
+TRANSPOSE_LIMIT = 5                      # semitones either side of the home key
+TRANSPOSE_STEPS = (-5, -2, 2, 5)         # one or two fifths, either way
 
 
 def _bit(name: str) -> int:
@@ -101,7 +110,8 @@ class Controller:
     def _drift_transpose(self) -> int:
         current = self.state.transpose
         if self.updates > 0 and self.updates % self.transpose_every == 0:
-            return self.rng.choice([v for v in TRANSPOSE_RANGE if v != current])
+            options = [current + d for d in TRANSPOSE_STEPS if abs(current + d) <= TRANSPOSE_LIMIT]
+            return self.rng.choice(options)
         return current
 
     def update(self, mood: Mood, lock: LockState | None = None) -> Controls:

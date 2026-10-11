@@ -408,7 +408,7 @@ _LAYERS: dict[MoodName, int] = {
 _TEMPO = {MoodName.EMPTY: 60.0, MoodName.COOKING: 72.0,
           MoodName.CONVERSATION: 66.0, MoodName.LOUD_BUSY: 84.0}
 _SCALE = {MoodName.EMPTY: "open", MoodName.COOKING: "pentatonic",
-          MoodName.CONVERSATION: "lydian", MoodName.LOUD_BUSY: "minor"}
+          MoodName.CONVERSATION: "dorian", MoodName.LOUD_BUSY: "lydian"}
 _TRANSPOSE = (0, 2, -1, 3)
 
 
