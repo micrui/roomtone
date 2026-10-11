@@ -106,6 +106,7 @@ QUIET_BAND_SNR_DB = -3.0    # predicted echo over leftover in the marker band, f
 LOST_ERLE_DROP_DB = 6.0     # a real room change also makes the old response fit this much worse
 REACQUIRE_JUMP = 16.0       # a marker this far off the drift line means the delay re-settled
 STABLE_CHANGE = 0.3         # response change below this counts as stable
+CHANGE_SHIFT = 2.0          # samples of timing slack when comparing responses (see rir_change)
 LOST_CHANGE = 0.6           # response change above this, after lock, means the room changed
 HISTORY_POINTS = 12         # markers kept for the drift fit
 JITTER_POINTS = 5           # latest markers the jitter is measured over
@@ -229,7 +230,18 @@ def marker_drift(mic: np.ndarray, marker: np.ndarray, lag: float, sample_rate: i
         k = int(np.argmax(np.abs(c)))
         xs.append(float(a))
         offs.append(k + _refine_peak(c, k) - reach)
-    return _fit_line(xs, offs)[0] * 1e6 if len(xs) >= 2 else 0.0
+    if len(xs) < 2:
+        return 0.0
+    xa, ya = np.asarray(xs), np.asarray(offs)
+    # Theil-Sen: the median of pairwise slopes, so one piece that locked onto music
+    # instead of the marker cannot tilt the line
+    slopes = [(ya[j] - ya[i]) / (xa[j] - xa[i]) for i in range(len(xa)) for j in range(i + 1, len(xa))]
+    slope = float(np.median(slopes))
+    # a slope smaller than its own uncertainty is noise: report no drift rather than
+    # a few ppm that smear the first block (30 s of 10 ppm is 13 samples)
+    resid = ya - (np.median(ya) + slope * (xa - np.median(xa)))
+    se = np.sqrt(np.sum(resid ** 2) / max(1, len(xa) - 2) / np.sum((xa - xa.mean()) ** 2))
+    return slope * 1e6 if abs(slope) > 2.0 * se else 0.0
 
 
 def _fit_line(x: Sequence[float], y: Sequence[float]) -> tuple[float, float, float]:
@@ -354,12 +366,37 @@ def band_limit(h: np.ndarray, lo_hz: float, hi_hz: float, sample_rate: int) -> n
     return irfft(H, n)
 
 
-def rir_change(a: np.ndarray, b: np.ndarray) -> float:
-    """Normalised L2 distance 2|a - b| / (|a| + |b|): 0 when identical, 2 when b = -a."""
+def rir_change(a: np.ndarray, b: np.ndarray, max_shift: float = 0.0) -> float:
+    """Normalised L2 distance 2|a - b| / (|a| + |b|): 0 when identical, 2 when b = -a.
+
+    With `max_shift`, b may slide up to that many samples (to a fraction of a sample)
+    to best match a before the distance is taken. Two estimates of the same room made
+    with delays half a sample apart look nothing alike in the marker band (half a
+    sample at 8 kHz is 45 degrees), and that much timing jitter is normal on real
+    hardware; the drift line owns the timing, so the comparison should not.
+    """
     n = max(len(a), len(b))
     a2, b2 = _fit(n, a), _fit(n, b)
-    den = float(np.linalg.norm(a2) + np.linalg.norm(b2))
-    return float(2.0 * np.linalg.norm(a2 - b2) / den) if den > 0 else 0.0
+    ea, eb = float(np.dot(a2, a2)), float(np.dot(b2, b2))
+    den = float(np.sqrt(ea) + np.sqrt(eb))
+    if den <= 0:
+        return 0.0
+    if max_shift <= 0:
+        return float(2.0 * np.linalg.norm(a2 - b2) / den)
+    nfft = next_fast_len(2 * n, real=True)
+    c = irfft(rfft(a2, nfft) * np.conj(rfft(b2, nfft)), nfft)   # c[k] = sum a2[i + k] b2[i]
+    shift = int(np.ceil(max_shift))
+    lags = np.arange(-shift, shift + 1)
+    k = int(lags[np.argmax(c[lags % nfft])])
+    # interpolate the correlation on a fine grid around the best integer lag
+    half, steps = 16, 32
+    idx = np.arange(k - half - 1, k + half + 2)
+    tau = np.linspace(k - 1.0, k + 1.0, 2 * steps + 1)
+    tau = tau[np.abs(tau) <= max_shift] if np.any(np.abs(tau) <= max_shift) else np.array([float(k)])
+    d = tau[:, None] - idx[None, :]
+    w = np.sinc(d) * np.i0(8.0 * np.sqrt(np.clip(1.0 - (d / (half + 1)) ** 2, 0.0, 1.0))) / np.i0(8.0)
+    cmax = float(np.max(w @ c[idx % nfft]))
+    return float(2.0 * np.sqrt(max(ea + eb - 2.0 * cmax, 0.0)) / den)
 
 
 # Baseline ---------------------------------------------------------------------
@@ -595,7 +632,8 @@ class Locker:
             if self._rir is not None:
                 lo, hi = band if self._rir_band is None else (max(band[0], self._rir_band[0]),
                                                               min(band[1], self._rir_band[1]))
-                change = rir_change(band_limit(est, lo, hi, fs), band_limit(self._rir, lo, hi, fs))
+                change = rir_change(band_limit(est, lo, hi, fs), band_limit(self._rir, lo, hi, fs),
+                                    max_shift=CHANGE_SHIFT)
 
             # 5. adapt on quiet blocks only; loud blocks subtract with the frozen response
             if quiet:

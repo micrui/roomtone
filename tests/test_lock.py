@@ -89,6 +89,28 @@ def test_estimate_rir_recovers_a_known_response(rng):
     assert np.linalg.norm(blended[:1500] - 0.5 * h) / np.linalg.norm(0.5 * h) < 0.02
 
 
+def test_rir_change_tolerates_timing_jitter_when_asked():
+    fs = 44100
+    h = lock.band_limit(synthetic_rir(fs, np.random.default_rng(3), length_s=0.2), 4000, 10000, fs)
+    shifted = lock.warp(h, np.arange(len(h)) - 0.5)      # the same room, half a sample later
+    assert lock.rir_change(h, shifted) > lock.STABLE_CHANGE   # in the marker band half a sample already reads as change
+    assert lock.rir_change(h, shifted, max_shift=2.0) < 0.1
+    other = lock.band_limit(synthetic_rir(fs, np.random.default_rng(4), length_s=0.2), 4000, 10000, fs)
+    assert lock.rir_change(h, other, max_shift=2.0) > lock.LOST_CHANGE
+
+
+def test_marker_drift_ignores_one_wild_piece_and_reports_no_drift_for_noise(rng):
+    fs, params = 44100, MarkerParams(length_s=4.0)
+    m = generate(params, fs).astype(np.float64)
+    room = np.zeros(int(0.5 * fs) + len(m) + int(0.5 * fs))
+    room[int(0.5 * fs):int(0.5 * fs) + len(m)] = m
+    assert lock.marker_drift(room + 0.01 * rng.standard_normal(len(room)), m, int(0.5 * fs), fs) == 0.0
+    r = 1.0 + 60e-6                                      # mic 60 ppm fast
+    fast = lock.warp(room, np.arange(int(len(room) / r)) * r)
+    est = lock.marker_drift(fast + 0.01 * rng.standard_normal(len(fast)), m, int(0.5 * fs) / r, fs)
+    assert est == pytest.approx(-60.0, abs=6.0) or est == pytest.approx(60.0, abs=6.0)
+
+
 def test_rir_change_bounds():
     a = np.array([1.0, 0.5, -0.2])
     assert lock.rir_change(a, a) == 0.0

@@ -121,5 +121,11 @@ class Config:
     mic_input_device: str = "MacBook Air Microphone"
     output_device: str = "MacBook Air Speakers"
     aggregate_device: str | None = "roomtone"
+    # Fold the M8 to mono before it goes out. The Listener models one path from
+    # "what we played" to the mic; two speakers playing different signals (the
+    # M8's stereo effects make left and right nearly uncorrelated) cannot be
+    # subtracted with one response. Measured on the laptop rig: 2 dB of echo
+    # suppression in stereo, 20 dB in mono.
+    mono_output: bool = True
     midi_out_port: str | None = "M8"
     log_dir: str = "logs"

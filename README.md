@@ -52,6 +52,11 @@ This follows [docs/SPEC.md](docs/SPEC.md) section 3 with one change: the mixer a
 in the roomtone Python process, which owns the "roomtone" aggregate audio device (M8 in, mic
 in, built-in output). SuperCollider only carries SuperDirt's MIDI output to the M8 and plays
 no audio in v1. The processes talk over OSC on localhost, and each can be restarted alone.
+The mixer folds the M8 to mono before it goes out (`mono_output` in `roomtone/config.py`):
+the Listener models one path from output to mic, and the M8's stereo effects make its two
+channels nearly independent, so two speakers playing different signals would leave the
+difference in the residual. On the laptop rig that was the difference between 2 dB and
+20 dB of echo suppression.
 
 ## Install
 

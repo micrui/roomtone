@@ -69,7 +69,8 @@ def test_callback_mixes_marker_and_stamps_rings(rng):
     mic = (0.05 * rng.standard_normal(256)).astype(np.float32)
     out = backend.pump(256, m8, mic)
 
-    np.testing.assert_allclose(out, m8 + 0.01, atol=1e-7)
+    mono = np.repeat(m8.mean(axis=1, keepdims=True), 2, axis=1)  # folded: one signal, both speakers
+    np.testing.assert_allclose(out, mono + 0.01, atol=1e-7)
     assert io.reference_ring.position == io.mic_ring.position == io.position == 256
     np.testing.assert_array_equal(io.reference_ring.read(256, at=0), out)
     np.testing.assert_array_equal(io.mic_ring.read(256, at=0)[:, 0], mic)
@@ -78,6 +79,16 @@ def test_callback_mixes_marker_and_stamps_rings(rng):
     for _ in range(5):
         backend.pump(256, m8, mic)
     assert io.reference_ring.position == io.mic_ring.position == 6 * 256
+
+
+def test_stereo_output_when_mono_fold_is_off(rng):
+    backend = FakeBackend()
+    cfg = small_cfg()
+    cfg.mono_output = False
+    io = AudioIO(cfg, lambda n, rms: np.zeros(n, np.float32), backend=backend)
+    io.start()
+    m8 = (0.1 * rng.standard_normal((256, 2))).astype(np.float32)
+    np.testing.assert_array_equal(backend.pump(256, m8), m8)
 
 
 def test_music_rms_tracks_last_second():

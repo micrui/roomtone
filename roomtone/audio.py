@@ -5,7 +5,10 @@ sound card asks for a block, the callback here:
 
 1. takes the M8's stereo pair from the input channels,
 2. asks the marker source for this block's marker (zeros most of the time),
-3. adds the marker to both output channels and sends the mix to the speakers,
+3. adds the marker to both output channels and sends the mix to the speakers
+   (the M8 is folded to mono first unless `Config.mono_output` is off: the
+   Listener models one path from output to mic, and two speakers playing
+   different signals would leave the difference in the residual),
 4. writes that exact mix (the "reference", spec section 4.3) and the mic
    channel into two ring buffers, stamped with the same frame position.
 
@@ -420,6 +423,10 @@ class AudioIO:
         right = indata[:frames, self.m8_channels[1]]
         if self.mute_music:
             mix.fill(0.0)
+        elif self.cfg.mono_output:          # one signal on both speakers: one path to model
+            np.add(left, right, out=mix[:, 0])
+            mix[:, 0] *= 0.5
+            mix[:, 1] = mix[:, 0]
         else:
             mix[:, 0] = left
             mix[:, 1] = right
