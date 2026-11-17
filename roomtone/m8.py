@@ -174,8 +174,9 @@ class Screen:
         return label, under
 
     def find_row(self, label: str) -> int | None:
+        """The first row below the title whose text starts with `label`."""
         for y in self.rows():
-            if self.row_text(y).strip().startswith(label):
+            if y > TITLE_Y and self.row_text(y).strip().startswith(label):
                 return y
         return None
 
@@ -367,3 +368,434 @@ def read_info(link: M8Link) -> dict[str, Any]:
                 info["track_midi_input"] = parse_track_table(page)
         nav.back()
     return info
+
+
+# --- editing ---------------------------------------------------------------------
+
+# SHIFT+arrow hops between views, as the sidebar map shows them. Titles carry a
+# number ("INST. 00"); `view_name` strips it.
+VIEW_GRAPH: dict[str, dict[str, str]] = {
+    "PROJECT": {"shift+down": "SONG"},
+    "SONG": {"shift+up": "PROJECT", "shift+right": "CHAIN", "shift+down": "MIXER"},
+    "CHAIN": {"shift+left": "SONG", "shift+right": "PHRASE"},
+    "PHRASE": {"shift+left": "CHAIN", "shift+right": "INST."},
+    "INST.": {"shift+left": "PHRASE", "shift+right": "TABLE", "shift+up": "INST. MODS", "shift+down": "MIXER"},
+    "INST. MODS": {"shift+down": "INST."},
+    "TABLE": {"shift+left": "INST."},
+    "MIXER": {},                        # SHIFT+UP returns to whichever row view it was entered from
+}
+
+
+def view_name(title: str) -> str:
+    """'INST. MODS 00' -> 'INST. MODS', 'CHAIN 00' -> 'CHAIN', 'SYSTEM SETTINGS' unchanged."""
+    for name in sorted(VIEW_GRAPH, key=len, reverse=True):
+        if title == name or title.startswith(name + " "):
+            return name
+    return title
+
+
+def view_route(start: str, goal: str) -> list[str] | None:
+    """The hops (as 'shift+down' strings) from one view to another, or None."""
+    seen = {start: []}
+    queue = [start]
+    while queue:
+        here = queue.pop(0)
+        if here == goal:
+            return seen[here]
+        for hop, there in VIEW_GRAPH.get(here, {}).items():
+            if there not in seen:
+                seen[there] = seen[here] + [hop]
+                queue.append(there)
+    return None
+
+
+def row_tokens(screen: Screen, y: int) -> list[tuple[int, str]]:
+    """(pixel x, text) of each run of characters on row y, left to right."""
+    cells = sorted((x, c) for (yy, x), c in screen.chars.items() if yy == y)
+    dx = screen._cell_width()
+    tokens: list[tuple[int, str]] = []
+    for x, c in cells:
+        if tokens and x - tokens[-1][0] == dx * len(tokens[-1][1]) and c != " ":
+            tokens[-1] = (tokens[-1][0], tokens[-1][1] + c)
+        elif c != " ":
+            tokens.append((x, c))
+    return tokens
+
+
+def _hexval(text: str) -> int | None:
+    t = text.strip()[:2]
+    try:
+        return int(t, 16) if len(t) == 2 else None
+    except ValueError:
+        return None
+
+
+class Editor(Navigator):
+    """Navigation across views, cursor placement on a given cell, and value edits.
+
+    Every edit is verified on the screen; `set_value` returns what the field shows
+    afterwards, and raises if it cannot reach the target within its step budget.
+    """
+
+    CURSOR_LEFT_PX = 5          # the bracket starts this far left of the field's first character
+    confirm_dialogs = True      # answer "LOSE CHANGES?" with OK while stepping values
+
+    def view(self) -> str:
+        return view_name(self.s.title())
+
+    def goto_view(self, goal: str, wait: float = 0.8, max_hops: int = 12) -> bool:
+        """Hop towards `goal` one SHIFT+arrow at a time, re-routing from wherever each hop
+        actually lands: the Mixer's exits lead back to whichever row view it was entered
+        from, so the map is only a guide."""
+        self.link.read(0.2)
+        for _ in range(max_hops):
+            here = self.view()
+            if here == goal:
+                return True
+            route = view_route(here, goal)
+            if not route:
+                # the Mixer, a settings page or a dialog: step back out and look again
+                self.link.press("shift", "up" if here == "MIXER" else "left", wait=wait)
+                continue
+            self.link.press(*route[0].split("+"), wait=wait)
+        return self.view() == goal
+
+    def cursor_cell(self) -> tuple[int, int] | None:
+        """(y, x of first character) the cursor sits on, or None."""
+        if self.s.cursor is None:
+            return None
+        x0, y0, _, _ = self.s.cursor
+        y = min(self.s.rows(), key=lambda yy: abs(yy - y0))
+        return y, x0 + self.CURSOR_LEFT_PX
+
+    def goto_cell(self, y: int, x: int, max_steps: int = 40) -> bool:
+        """Move the cursor to the field whose first character is at pixel (x, y)."""
+        if self.s.cursor is None:
+            self.link.press("down", wait=0.25)
+            self.link.press("up", wait=0.25)
+        for _ in range(max_steps):
+            cell = self.cursor_cell()
+            if cell is None:
+                return False
+            cy, cx = cell
+            if abs(cy - y) <= 3 and abs(cx - x) <= 3:
+                return True
+            before = cell
+            if abs(cy - y) > 3:
+                self.link.press("down" if cy < y else "up", wait=0.25)
+            else:
+                self.link.press("right" if cx < x else "left", wait=0.25)
+            if self.cursor_cell() == before:
+                return False               # the cursor cannot go that way
+        return False
+
+    def goto_token(self, row_prefix: str, index: int = 0, after: str | None = None) -> bool:
+        """Cursor onto token `index` (counting from the first token after `after`, when given)
+        of the first row whose text starts with `row_prefix`."""
+        y = self.s.find_row(row_prefix)
+        if y is None:
+            return False
+        tokens = row_tokens(self.s, y)
+        if after is not None:
+            k = next((i for i, (_, t) in enumerate(tokens) if t == after), None)
+            if k is None:
+                return False
+            tokens = tokens[k + 1:]
+        if index >= len(tokens):
+            return False
+        return self.goto_cell(y, tokens[index][0])
+
+    def value(self) -> str:
+        return self.s.cursor_field()[1]
+
+    def set_value(self, target: str, max_steps: int = 300) -> str:
+        """Step the field under the cursor to `target` with EDIT+arrows and verify.
+
+        Hex fields ('80', 'E0') are stepped by 16 with up/down and by 1 with
+        left/right; anything else (ON/OFF, MONO, SAMPLER, 01ADSR ENV) is stepped
+        right until the text starts with `target`, wrapping at most once.
+        """
+        target = target.strip()
+        current = self.value()
+        if current.startswith(target):
+            return current
+        tv, cv = _hexval(target), _hexval(current)
+        if tv is not None and cv is not None and len(target) == 2:
+            steps = 0
+            while steps < max_steps:
+                cv = _hexval(self.value())
+                if cv is None or cv == tv:
+                    break
+                diff = tv - cv
+                if abs(diff) >= 16:
+                    self.link.press("edit", "up" if diff > 0 else "down", wait=0.15)
+                else:
+                    self.link.press("edit", "right" if diff > 0 else "left", wait=0.15)
+                steps += 1
+            got = self.value()
+            if _hexval(got) != tv:
+                raise RuntimeError(f"could not set {self.s.cursor_field()[0]!r} to {target}: shows {got!r}")
+            return got
+        seen = {current}
+        for direction in ("right", "left"):       # walk to one end of the list, then to the other
+            for _ in range(max_steps):
+                before = self.value()
+                self.link.press("edit", direction, wait=0.15)
+                if self.confirm_dialogs and dialog_text(self.s):
+                    self.answer_dialog(ok=True)   # type: ignore[attr-defined]
+                v = self.value()
+                if v.startswith(target):
+                    return v
+                seen.add(v)
+                if v == before:
+                    break
+        raise RuntimeError(f"could not set {self.s.cursor_field()[0]!r} to {target!r}: saw {sorted(seen)}")
+
+    def learn(self, send_cc: Callable[[], None], hold: float = 0.4) -> None:
+        """MIDI learn for the field under the cursor: hold OPTION while `send_cc` sends the CC."""
+        self.link.ser.write(bytes([0x43, KEYS["option"]]))
+        self.link.ser.flush()
+        self.link.sleep(0.15)
+        send_cc()
+        self.link.sleep(hold)
+        self.link.ser.write(bytes([0x43, 0]))
+        self.link.ser.flush()
+        self.link.read(0.4)
+
+
+# --- dialogs ------------------------------------------------------------------------
+
+def dialog_text(screen: Screen) -> str | None:
+    """The question of a modal 'OK CANCEL' dialog if one is showing, else None."""
+    lines = [l.strip() for l in screen.text().splitlines() if l.strip()]
+    if any(l.replace(" ", "") == "OKCANCEL" for l in lines):
+        return " ".join(l for l in lines if l.replace(" ", "") != "OKCANCEL")
+    return None
+
+
+def _answer_dialog(self: "Editor", ok: bool) -> str | None:
+    """Answer a showing dialog with OK or CANCEL; returns its text, or None if no dialog."""
+    text = dialog_text(self.s)
+    if text is None:
+        return None
+    want = "OK" if ok else "CANCEL"
+    for _ in range(4):
+        if self.value() == want:
+            break
+        self.link.press("right" if want == "CANCEL" else "left", wait=0.25)
+    if self.value() != want:
+        self.link.press("edit", "right" if want == "CANCEL" else "left", wait=0.25)
+    self.link.press("edit", hold=0.4, wait=1.0)    # a short tap does not confirm OK
+    if dialog_text(self.s):
+        self.link.press("edit", hold=0.5, wait=1.0)
+    return text
+
+
+Editor.answer_dialog = _answer_dialog  # type: ignore[attr-defined]
+
+
+# --- applying a song definition --------------------------------------------------------
+
+def _goto_row_token(ed: "Editor", y: int, index_after_label: int) -> bool:
+    tokens = row_tokens(ed.s, y)
+    if index_after_label >= len(tokens):
+        return False
+    return ed.goto_cell(y, tokens[index_after_label][0])
+
+
+def select_instrument(ed: "Editor", number: int) -> bool:
+    """Show instrument `number` in the Instrument view, via a phrase step's I column."""
+    if not ed.goto_view("PHRASE"):
+        return False
+    y = ed.s.rows()[2] if len(ed.s.rows()) > 2 else None   # the first step row, under the header
+    y = ed.s.find_row("<0") or ed.s.find_row("0 ") or y
+    tokens = row_tokens(ed.s, y)
+    if len(tokens) < 4:
+        return False
+    if not ed.goto_cell(y, tokens[3][0]):                  # N V I ...: the I column
+        return False
+    if ed.value().strip() == "--":                         # an empty step: give it a note first
+        ed.goto_cell(y, tokens[1][0])
+        ed.link.press("edit", wait=0.3)
+        ed.goto_cell(y, tokens[3][0])
+    ed.set_value(f"{number:02X}")
+    return ed.goto_view("INST.") and ed.s.title() == f"INST. {number:02X}"
+
+
+def apply_instrument(ed: "Editor", spec: Any, log: Callable[[str], None] = print) -> list[str]:
+    """Write one Instrument spec; returns the fields that did not verify."""
+    problems: list[str] = []
+    if not select_instrument(ed, spec.number):
+        return [f"could not open instrument {spec.number:02X} (at {ed.s.title()!r})"]
+    ed.goto_token("TYPE", 0, after="TYPE")
+    got = ed.set_value(spec.type)
+    if dialog_text(ed.s):
+        ed.answer_dialog(ok=True)   # type: ignore[attr-defined]
+    log(f"  INST {spec.number:02X} {spec.name}: TYPE {got}")
+    for row, after, value in spec.inst:
+        try:
+            if not ed.goto_token(row, 0, after=after):
+                problems.append(f"{spec.number:02X} {row}/{after}: field not found")
+                continue
+            got = ed.set_value(value)
+            log(f"    {row:<8}{after:<8} {got}")
+        except RuntimeError as exc:
+            problems.append(str(exc))
+    if spec.mods:
+        if not ed.goto_view("INST. MODS"):
+            return problems + [f"{spec.number:02X}: MODS page not reached"]
+        for mod, fld, value in spec.mods:
+            header = f"MOD{1 if mod in (1, 3) else 2}"
+            y0 = ed.s.find_row(header)
+            if y0 is None:
+                problems.append(f"{spec.number:02X} MOD{mod}: row not found")
+                continue
+            col = 1 if mod in (1, 2) else 3                 # left pair or right pair of the row
+            if fld == "TYPE":
+                ok = _goto_row_token(ed, y0, col)
+            else:
+                # the field's row is below the header; find it by label in the right column
+                ok = False
+                for k in range(1, 8):
+                    y = y0 + ROW_PX * k
+                    toks = row_tokens(ed.s, y)
+                    labels = [t for _, t in toks]
+                    if fld in labels:
+                        idx = labels.index(fld) if mod in (1, 2) else len(labels) - 1 - labels[::-1].index(fld)
+                        ok = ed.goto_cell(y, toks[idx + 1][0]) if idx + 1 < len(toks) else False
+                        break
+            if not ok:
+                problems.append(f"{spec.number:02X} MOD{mod} {fld}: field not found")
+                continue
+            try:
+                got = ed.set_value(value)
+                log(f"    MOD{mod} {fld:<5} {got}")
+            except RuntimeError as exc:
+                problems.append(str(exc))
+        ed.goto_view("INST.")
+    return problems
+
+
+# --- MIDI learn --------------------------------------------------------------------------
+
+def _mixer_rows(ed: "Editor") -> tuple[int, int]:
+    """(y of the track volume row, y of the MX/DE/RE effect level row) in the Mixer."""
+    s = ed.s
+    two = {y: [t for _, t in row_tokens(s, y) if len(t) == 2 and _hexval(t) is not None] for y in s.rows()}
+    vol = min(y for y, toks in two.items() if len(toks) >= 8)
+    fx = min(y for y, toks in two.items() if y > vol and len(toks) >= 3)
+    return vol, fx
+
+
+def goto_target(ed: "Editor", where: tuple) -> bool:
+    """Put the cursor on a MIDI-learn target (see roomtone.m8_song.MAPPINGS)."""
+    kind = where[0]
+    if kind == "project":
+        return ed.goto_view("PROJECT") and ed.goto(where[1], "")
+    if kind == "inst":
+        return select_instrument(ed, where[1]) and ed.goto_token(where[2], 0, after=where[2])
+    if kind in ("mixer-track", "mixer-fx"):
+        if not ed.goto_view("MIXER"):
+            return False
+        vol, fx = _mixer_rows(ed)
+        if kind == "mixer-track":
+            toks = row_tokens(ed.s, vol)
+            return ed.goto_cell(vol, toks[where[1] - 1][0])
+        index = {"MX": 0, "DE": 1, "RE": 2}[where[1]]
+        return ed.goto_cell(fx, row_tokens(ed.s, fx)[index][0])
+    if kind == "eq":
+        if not ed.goto_view("MIXER"):
+            return False
+        cell = next(((y, x) for y in ed.s.rows() for x, t in row_tokens(ed.s, y) if t == "EQ"), None)
+        if cell is None or not ed.goto_cell(*cell):
+            return False
+        ed.link.press("edit", wait=1.2)
+        if ed.s.title() != "MIX EQ":
+            return False
+        y = ed.s.find_row("GAIN")
+        toks = row_tokens(ed.s, y)
+        band = {"LOW": 1, "MID": 2, "HIGH": 3}[where[1]]
+        return ed.goto_cell(y, toks[band][0])
+    return False
+
+
+def leave_target(ed: "Editor", where: tuple) -> None:
+    if where[0] == "eq":
+        ed.link.press("shift", "left", wait=1.0)
+
+
+def learn_mappings(ed: "Editor", mappings: list[tuple[int, tuple]], send_cc: Callable[[int], None],
+                   log: Callable[[str], None] = print) -> list[str]:
+    """MIDI-learn each (cc, target): hold OPTION on the field while `send_cc(cc)` sends it."""
+    problems: list[str] = []
+    for cc, where in mappings:
+        if not goto_target(ed, where):
+            problems.append(f"CC {cc}: target {where} not reached (at {ed.s.title()!r})")
+            continue
+        label = ed.s.cursor_field()
+        ed.learn(lambda: send_cc(cc))
+        log(f"  CC {cc:<3} -> {ed.s.title():<10} {label}")
+        leave_target(ed, where)
+    return problems
+
+
+# --- naming and saving --------------------------------------------------------------------
+
+NAME_LENGTH = 12
+
+
+def set_project_name(ed: "Editor", name: str, max_steps: int = 80) -> str:
+    """Type `name` into the Project view's NAME field, one character at a time.
+
+    EDIT on the field enters character mode: the cursor box sits over one character
+    (7 px left of it), LEFT/RIGHT move along the name, EDIT+arrows change the
+    character. Unused positions are stepped to blank. Returns the name shown afterwards.
+    """
+    name = name.upper()[:NAME_LENGTH]
+    if not (ed.goto_view("PROJECT") and ed.goto("NAME", "")):
+        raise RuntimeError("could not reach the NAME field")
+    y = ed.s.find_row("NAME")
+    dx = ed.s._cell_width()
+    x_first = min(x for (yy, x), c in ed.s.chars.items() if yy == y and x >= 14 * dx and c != " ")
+    ed.link.press("edit", wait=0.5)                     # character mode
+    for _ in range(NAME_LENGTH):                        # to the first character
+        before = ed.s.cursor
+        ed.link.press("left", wait=0.12)
+        if ed.s.cursor == before:
+            break
+    for i in range(NAME_LENGTH):
+        want = name[i] if i < len(name) else " "
+        x = x_first + dx * i
+        if i > 0:
+            before = ed.s.cursor
+            ed.link.press("right", wait=0.12)
+            if ed.s.cursor == before:
+                break                                   # no more positions
+        def have() -> str:
+            return ed.s.chars.get((y, x), " ")
+        if have() == want:
+            continue
+        for direction in ("right", "left"):
+            for _ in range(max_steps):
+                before_c = have()
+                ed.link.press("edit", direction, wait=0.1)
+                if have() == want or have() == before_c:
+                    break
+            if have() == want:
+                break
+    ed.link.press("down", wait=0.4)                     # leave character mode
+    ed.link.read(0.3)
+    return ed.s.row_text(y)[14:].strip()
+
+
+def save_project(ed: "Editor") -> str | None:
+    """PROJECT -> SAVE in the Project view; answers an overwrite dialog with OK.
+    Returns the dialog text if one was shown."""
+    if not (ed.goto_view("PROJECT") and ed.goto("PROJECT", "SAVE")):
+        raise RuntimeError("could not reach PROJECT / SAVE")
+    ed.link.press("edit", hold=0.4, wait=1.5)
+    text = dialog_text(ed.s)
+    if text:
+        ed.answer_dialog(ok=True)   # type: ignore[attr-defined]
+    ed.link.read(1.0)
+    return text
