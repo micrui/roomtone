@@ -143,3 +143,7 @@ file at any moment and play along with the room, and neither of you overwrites t
 - Tidal patterns and the SuperCollider startup were written carefully but never
   evaluated here. Expect to fix a name or two on first evaluation.
 - YAMNet labels are wired but need the model file and the `roomtone[yamnet]` extra.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
